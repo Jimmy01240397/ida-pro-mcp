@@ -6,6 +6,7 @@ per-worker lock serialises requests so multiple agents can safely share
 the same session manager.
 """
 
+import atexit
 import json
 import logging
 import os
@@ -122,12 +123,16 @@ class IDASessionManager:
             session = self._sessions.pop(session_id, None)
         if session is None:
             return False
-        self._terminate_worker(session)
+        # Wait for any in-flight I/O to finish before terminating.
+        with session._lock:
+            self._terminate_worker(session)
         logger.info("Session closed: %s", session_id)
         return True
 
     def proxy_jsonrpc(self, session_id: str, method: str, params: dict) -> dict:
         """Send a JSON-RPC request to a worker and return the parsed response."""
+        # Acquire session._lock while still holding self._lock so that
+        # close_session cannot terminate the worker in the gap.
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -138,12 +143,15 @@ class IDASessionManager:
                     "Close and re-open the binary."
                 )
             session.last_accessed = datetime.now()
+            session._lock.acquire()
 
-        request_line = json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        ).encode() + b"\n"
-
-        with session._lock:
+        # self._lock is released — other sessions can proceed.
+        # session._lock is held — close_session will block on _terminate_worker
+        # because we hold the I/O lock.
+        try:
+            request_line = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            ).encode() + b"\n"
             try:
                 session.process.stdin.write(request_line)
                 session.process.stdin.flush()
@@ -152,6 +160,8 @@ class IDASessionManager:
                 raise RuntimeError(
                     f"Worker pipe broken for session {session_id}: {e}"
                 ) from e
+        finally:
+            session._lock.release()
 
         if not response_line:
             raise RuntimeError(
@@ -254,6 +264,14 @@ class IDASessionManager:
 
 _session_manager: Optional[IDASessionManager] = None
 _session_manager_lock = threading.Lock()
+
+
+def _cleanup_at_exit() -> None:
+    if _session_manager is not None:
+        _session_manager.close_all_sessions()
+
+
+atexit.register(_cleanup_at_exit)
 
 
 def get_session_manager() -> IDASessionManager:
