@@ -182,7 +182,8 @@ class IDASessionManager:
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for session in sessions:
-            self._terminate_worker(session)
+            with session._lock:
+                self._terminate_worker(session)
         logger.info("All sessions closed")
 
     # ------------------------------------------------------------------
