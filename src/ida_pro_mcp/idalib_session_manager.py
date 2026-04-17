@@ -70,6 +70,7 @@ class IDASessionManager:
     def __init__(self):
         self._sessions: Dict[str, IDAWorkerSession] = {}
         self._lock = threading.RLock()
+        self._pending_paths: set[str] = set()  # paths being opened (prevents duplicates)
         logger.info("IDASessionManager initialised")
 
     # ------------------------------------------------------------------
@@ -86,10 +87,12 @@ class IDASessionManager:
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
+        resolved = str(input_path.resolve())
+
         with self._lock:
             # Re-use existing session for the same binary
             for sid, session in self._sessions.items():
-                if session.input_path.resolve() == input_path.resolve():
+                if str(session.input_path.resolve()) == resolved:
                     if session.alive:
                         logger.info("Binary already open in session %s", sid)
                         session.last_accessed = datetime.now()
@@ -99,10 +102,25 @@ class IDASessionManager:
                         self._sessions.pop(sid)
                         break
 
-            # Hold the lock through spawn to prevent duplicate workers
-            # for the same binary from concurrent callers.
+            # Prevent duplicate spawns: if another thread is already
+            # opening this path, wait and return its session.
+            if resolved in self._pending_paths:
+                raise RuntimeError(
+                    f"Binary is already being opened: {input_path}"
+                )
+            self._pending_paths.add(resolved)
             session_id = str(uuid.uuid4())[:8]
+
+        # Spawn outside self._lock so other sessions aren't blocked.
+        try:
             worker = self._spawn_worker(input_path, timeout)
+        except Exception:
+            with self._lock:
+                self._pending_paths.discard(resolved)
+            raise
+
+        with self._lock:
+            self._pending_paths.discard(resolved)
             session = IDAWorkerSession(
                 session_id=session_id,
                 input_path=input_path,
