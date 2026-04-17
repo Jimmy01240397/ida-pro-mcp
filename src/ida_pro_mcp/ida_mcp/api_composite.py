@@ -253,7 +253,7 @@ def _analyze_function_internal(
         result["constants"] = _filter_constants(extract_function_constants(ea))
         # Callees/callers — names only.
         result["callees"] = _compact_callees(get_callees(hex(ea)))
-        result["callers"] = _compact_callees(get_callers(hex(ea)))
+        result["callers"] = _compact_callees(get_callers(hex(ea))[0])
         result["xrefs"] = get_all_xrefs(ea)
         result["comments"] = get_all_comments(ea)
         result["basic_blocks"] = _basic_block_info(ea)
@@ -392,7 +392,7 @@ def analyze_component(
     interface_functions: list[str] = []
     internal_only: list[str] = []
     for ea in ea_set:
-        callers = get_callers(hex(ea))
+        callers, _ = get_callers(hex(ea))
         has_external = False
         for c in (callers or []):
             caller_addr = c.get("addr") or c.get("start_ea")
@@ -543,8 +543,8 @@ _MAX_TRACE_EDGES = 500
 @tool_timeout(120.0)
 def trace_data_flow(
     addr: Annotated[str, "Starting address"],
+    max_depth: Annotated[int, "Maximum traversal depth"],
     direction: Annotated[str, "'forward' (xrefs from) or 'backward' (xrefs to)"] = "forward",
-    max_depth: Annotated[int, "Maximum traversal depth"] = 5,
 ) -> TraceDataFlowResult:
     """Follow cross-references from or to an address, automatically traversing
     multiple hops. Use 'forward' to see where data flows TO (xrefs-from), or
@@ -553,7 +553,7 @@ def trace_data_flow(
     data. Use this when you find an interesting string, constant, or global and
     want to understand every code path that touches it without manually chaining
     xrefs_to calls. Do not use for call graph traversal — use callgraph for that.
-    max_depth controls how many hops to follow (default 5, max 20)."""
+    max_depth controls how many hops to follow."""
 
     import idaapi
     import idautils
@@ -570,8 +570,6 @@ def trace_data_flow(
 
     if max_depth < 1:
         max_depth = 1
-    if max_depth > 20:
-        max_depth = 20
 
     visited: set[int] = set()
     nodes: list[dict] = []

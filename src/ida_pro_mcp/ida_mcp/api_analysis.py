@@ -51,6 +51,8 @@ from . import compat
 class DecompileResult(TypedDict):
     addr: str
     code: str | None
+    total_lines: NotRequired[int]
+    truncated: NotRequired[bool]
     refs: NotRequired[list[Ref]]
     error: NotRequired[str]
 
@@ -185,6 +187,8 @@ class XrefQueryResult(TypedDict, total=False):
 class StructFieldXrefsResult(TypedDict, total=False):
     struct: str
     field: str
+    total: int
+    more: bool
     xrefs: list[Xref]
     error: str
 
@@ -620,25 +624,25 @@ def _disasm_lines_limited(func: ida_funcs.func_t, max_insns: int) -> tuple[list[
 
 
 def _collect_basic_blocks_limited(
-    func: ida_funcs.func_t, max_blocks: int
-) -> tuple[list[BasicBlock], bool]:
+    func: ida_funcs.func_t, max_blocks: int, offset: int = 0
+) -> tuple[list[BasicBlock], bool, int]:
+    """Collect basic blocks with offset/limit. Returns (blocks, truncated, total)."""
     blocks: list[BasicBlock] = []
-    truncated = False
+    total = 0
     for block in idaapi.FlowChart(func):
-        if len(blocks) >= max_blocks:
-            truncated = True
-            break
-        blocks.append(
-            BasicBlock(
-                start=hex(block.start_ea),
-                end=hex(block.end_ea),
-                size=block.end_ea - block.start_ea,
-                type=block.type,
-                successors=[hex(s.start_ea) for s in block.succs()],
-                predecessors=[hex(p.start_ea) for p in block.preds()],
+        if total >= offset and len(blocks) < max_blocks:
+            blocks.append(
+                BasicBlock(
+                    start=hex(block.start_ea),
+                    end=hex(block.end_ea),
+                    size=block.end_ea - block.start_ea,
+                    type=block.type,
+                    successors=[hex(s.start_ea) for s in block.succs()],
+                    predecessors=[hex(p.start_ea) for p in block.preds()],
+                )
             )
-        )
-    return blocks, truncated
+        total += 1
+    return blocks, offset + len(blocks) < total, total
 
 
 def _collect_callees_for_function(func: ida_funcs.func_t) -> list[dict]:
@@ -748,14 +752,24 @@ def _profile_function(
 @tool_timeout(90.0)
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
+    offset: Annotated[int, "Starting line offset (default: 0)"] = 0,
+    max_lines: Annotated[int, "Max lines to return (default: 100, max: 200)"] = 100,
 ) -> DecompileResult:
     """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    if max_lines <= 0:
+        max_lines = 100
+    if max_lines > 200:
+        max_lines = 200
     try:
         start = parse_address(addr)
         code = decompile_function_safe(start)
         if code is None:
             return {"addr": addr, "code": None, "error": "Decompilation failed"}
-        result: DecompileResult = {"addr": addr, "code": code}
+        lines = code.split("\n")
+        total_lines = len(lines)
+        sliced = lines[offset:offset + max_lines]
+        is_truncated = (offset + max_lines) < total_lines
+        result: DecompileResult = {"addr": addr, "code": "\n".join(sliced), "total_lines": total_lines, "truncated": is_truncated}
         try:
             import ida_hexrays
 
@@ -778,8 +792,8 @@ def decompile(
 def disasm(
     addr: Annotated[str, "Function address or name to disassemble"],
     max_instructions: Annotated[
-        int, "Max instructions per function (default: 5000, max: 50000)"
-    ] = 5000,
+        int, "Max instructions per function (default: 100, max: 500)"
+    ] = 100,
     offset: Annotated[int, "Skip first N instructions (default: 0)"] = 0,
     include_total: Annotated[
         bool, "Compute total instruction count (default: false)"
@@ -788,8 +802,8 @@ def disasm(
     """Disassemble function with offset/max_instructions pagination and optional total count."""
 
     # Enforce max limit
-    if max_instructions <= 0 or max_instructions > 50000:
-        max_instructions = 50000
+    if max_instructions <= 0 or max_instructions > 500:
+        max_instructions = 500
     if offset < 0:
         offset = 0
 
@@ -944,11 +958,11 @@ def func_profile(
         q = str(query.get("addr", "*") or "*").strip()
         filter_pattern = str(query.get("filter", "") or "")
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(query.get("count", 50), 50, 0, 1000)
+        count = _clamp_int(query.get("count", 100), 100, 0, 100)
         sort_by = str(query.get("sort_by", "addr") or "addr")
         descending = bool(query.get("descending", False))
         include_lists = bool(query.get("include_lists", False))
-        max_items = _clamp_int(query.get("max_items", 25), 25, 0, 1000)
+        max_items = _clamp_int(query.get("max_items", 25), 25, 0, 100)
         include_prototype = bool(query.get("include_prototype", False))
 
         # Resolve candidate function starts.
@@ -1087,15 +1101,20 @@ def analyze_batch(
             include_proto = bool(query.get("include_proto", True))
 
             max_disasm_insns = _clamp_int(
-                query.get("max_disasm_insns", 300), 300, 0, 50_000
+                query.get("max_disasm_insns", 100), 100, 0, 500
             )
-            max_callers = _clamp_int(query.get("max_callers", 100), 100, 0, 5000)
-            max_callees = _clamp_int(query.get("max_callees", 100), 100, 0, 5000)
-            max_strings = _clamp_int(query.get("max_strings", 100), 100, 0, 5000)
+            max_callers = _clamp_int(query.get("max_callers", 100), 100, 0, 100)
+            max_callees = _clamp_int(query.get("max_callees", 100), 100, 0, 100)
+            max_strings = _clamp_int(query.get("max_strings", 100), 100, 0, 100)
             max_constants = _clamp_int(
-                query.get("max_constants", 200), 200, 0, 10000
+                query.get("max_constants", 100), 100, 0, 100
             )
-            max_blocks = _clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
+            max_blocks = _clamp_int(query.get("max_blocks", 100), 100, 0, 100)
+            off_callers = int(query.get("offset_callers", 0) or 0)
+            off_callees = int(query.get("offset_callees", 0) or 0)
+            off_strings = int(query.get("offset_strings", 0) or 0)
+            off_constants = int(query.get("offset_constants", 0) or 0)
+            off_blocks = int(query.get("offset_blocks", 0) or 0)
 
             analysis: dict = {
                 "size": hex(size_int),
@@ -1154,39 +1173,38 @@ def analyze_batch(
                 }
 
             if include_callers:
-                callers = get_callers(hex(fn.start_ea), limit=max_callers)
-                analysis["caller_count"] = len(callers)
+                callers, total_callers = get_callers(hex(fn.start_ea), limit=max_callers, offset=off_callers)
+                analysis["caller_count"] = total_callers
                 analysis["callers"] = callers
-                analysis["callers_truncated"] = (
-                    max_callers > 0 and len(callers) >= max_callers
-                )
+                analysis["callers_truncated"] = off_callers + len(callers) < total_callers
 
             if include_callees:
                 all_callees = get_callees(hex(fn.start_ea))
-                limited_callees, callees_truncated = _limit_items(all_callees, max_callees)
-                analysis["callee_count"] = len(all_callees)
-                analysis["callees"] = limited_callees
-                analysis["callees_truncated"] = callees_truncated
+                total_callees = len(all_callees)
+                sliced_callees = all_callees[off_callees : off_callees + max_callees]
+                analysis["callee_count"] = total_callees
+                analysis["callees"] = sliced_callees
+                analysis["callees_truncated"] = off_callees + len(sliced_callees) < total_callees
 
             if include_strings:
                 all_strings = extract_function_strings(fn.start_ea)
-                limited_strings, strings_truncated = _limit_items(all_strings, max_strings)
-                analysis["string_ref_count"] = len(all_strings)
-                analysis["strings"] = limited_strings
-                analysis["strings_truncated"] = strings_truncated
+                total_strings = len(all_strings)
+                sliced_strings = all_strings[off_strings : off_strings + max_strings]
+                analysis["string_ref_count"] = total_strings
+                analysis["strings"] = sliced_strings
+                analysis["strings_truncated"] = off_strings + len(sliced_strings) < total_strings
 
             if include_constants:
                 all_constants = extract_function_constants(fn.start_ea)
-                limited_constants, constants_truncated = _limit_items(
-                    all_constants, max_constants
-                )
-                analysis["constant_count"] = len(all_constants)
-                analysis["constants"] = limited_constants
-                analysis["constants_truncated"] = constants_truncated
+                total_constants = len(all_constants)
+                sliced_constants = all_constants[off_constants : off_constants + max_constants]
+                analysis["constant_count"] = total_constants
+                analysis["constants"] = sliced_constants
+                analysis["constants_truncated"] = off_constants + len(sliced_constants) < total_constants
 
             if include_basic_blocks:
-                blocks, blocks_truncated = _collect_basic_blocks_limited(fn, max_blocks)
-                analysis["basic_block_count"] = len(blocks)
+                blocks, blocks_truncated, total_blocks = _collect_basic_blocks_limited(fn, max_blocks, off_blocks)
+                analysis["basic_block_count"] = total_blocks
                 analysis["basic_blocks"] = blocks
                 analysis["basic_blocks_truncated"] = blocks_truncated
 
@@ -1222,32 +1240,36 @@ def analyze_batch(
 @idasync
 def xrefs_to(
     addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
-    limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
+    limit: Annotated[int, "Max xrefs per address (default: 100, max: 100)"] = 100,
+    offset: Annotated[int, "Skip first N xrefs (default: 0)"] = 0,
 ) -> list[XrefsToResult]:
     """Return xrefs to address(es) or named symbols, capped per target with truncation flag."""
     addrs = normalize_list_input(addrs)
 
-    if limit <= 0 or limit > 1000:
-        limit = 1000
+    if limit <= 0 or limit > 100:
+        limit = 100
 
     results = []
 
     for addr in addrs:
         try:
-            xrefs = []
-            more = False
+            all_xrefs = []
             for xref in idautils.XrefsTo(parse_address(addr)):
-                if len(xrefs) >= limit:
-                    more = True
-                    break
-                xrefs.append(
+                all_xrefs.append(
                     Xref(
                         addr=hex(xref.frm),
                         type="code" if xref.iscode else "data",
                         fn=get_function(xref.frm, raise_error=False),
                     )
                 )
-            results.append({"addr": addr, "xrefs": xrefs, "more": more})
+            total = len(all_xrefs)
+            sliced = all_xrefs[offset : offset + limit]
+            results.append({
+                "addr": addr,
+                "xrefs": sliced,
+                "total": total,
+                "more": offset + len(sliced) < total,
+            })
         except Exception as e:
             results.append({"addr": addr, "xrefs": None, "error": str(e)})
 
@@ -1271,7 +1293,7 @@ def xref_query(
         direction = str(query.get("direction", "both") or "both").lower()
         xref_type = str(query.get("xref_type", "any") or "any").lower()
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(query.get("count", 200), 200, 0, 5000)
+        count = _clamp_int(query.get("count", 100), 100, 0, 100)
         include_fn = bool(query.get("include_fn", True))
         dedup = bool(query.get("dedup", True))
         sort_by = str(query.get("sort_by", "addr") or "addr")
@@ -1378,10 +1400,17 @@ def xref_query(
 @idasync
 def xrefs_to_field(
     queries: list[StructFieldQuery] | StructFieldQuery,
+    offset: Annotated[int, "Starting index (default: 0)"] = 0,
+    limit: Annotated[int, "Max xrefs per query (default: 100, max: 100)"] = 100,
 ) -> list[StructFieldXrefsResult]:
     """Get cross-references to structure fields"""
     if isinstance(queries, dict):
         queries = [queries]
+
+    if limit <= 0:
+        limit = 100
+    if limit > 100:
+        limit = 100
 
     results = []
     til = ida_typeinf.get_idati()
@@ -1390,6 +1419,8 @@ def xrefs_to_field(
             {
                 "struct": q.get("struct"),
                 "field": q.get("field"),
+                "total": 0,
+                "more": False,
                 "xrefs": [],
                 "error": "Failed to retrieve type library",
             }
@@ -1409,6 +1440,8 @@ def xrefs_to_field(
                     {
                         "struct": struct_name,
                         "field": field_name,
+                        "total": 0,
+                        "more": False,
                         "xrefs": [],
                         "error": f"Struct '{struct_name}' not found",
                     }
@@ -1421,6 +1454,8 @@ def xrefs_to_field(
                     {
                         "struct": struct_name,
                         "field": field_name,
+                        "total": 0,
+                        "more": False,
                         "xrefs": [],
                         "error": f"Field '{field_name}' not found in '{struct_name}'",
                     }
@@ -1433,28 +1468,35 @@ def xrefs_to_field(
                     {
                         "struct": struct_name,
                         "field": field_name,
+                        "total": 0,
+                        "more": False,
                         "xrefs": [],
                         "error": "Unable to get tid",
                     }
                 )
                 continue
 
-            xrefs = []
+            all_xrefs = []
             xref: ida_xref.xrefblk_t
             for xref in idautils.XrefsTo(tid):
-                xrefs += [
+                all_xrefs += [
                     Xref(
                         addr=hex(xref.frm),
                         type="code" if xref.iscode else "data",
                         fn=get_function(xref.frm, raise_error=False),
                     )
                 ]
-            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs})
+            total = len(all_xrefs)
+            sliced = all_xrefs[offset:offset + limit]
+            more = (offset + limit) < total
+            results.append({"struct": struct_name, "field": field_name, "total": total, "more": more, "xrefs": sliced})
         except Exception as e:
             results.append(
                 {
                     "struct": struct_name,
                     "field": field_name,
+                    "total": 0,
+                    "more": False,
                     "xrefs": [],
                     "error": str(e),
                 }
@@ -1472,13 +1514,14 @@ def xrefs_to_field(
 @idasync
 def callees(
     addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
-    limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
+    limit: Annotated[int, "Max callees per function (default: 100, max: 100)"] = 100,
+    offset: Annotated[int, "Skip first N callees (default: 0)"] = 0,
 ) -> list[CalleesResult]:
     """Return unique callees per function, capped by limit."""
     addrs = normalize_list_input(addrs)
 
-    if limit <= 0 or limit > 500:
-        limit = 500
+    if limit <= 0 or limit > 100:
+        limit = 100
 
     results = []
 
@@ -1493,12 +1536,8 @@ def callees(
                 continue
             func_end = func.end_ea
             callees_dict = {}
-            more = False
             current_ea = func_start
             while current_ea < func_end:
-                if len(callees_dict) >= limit:
-                    more = True
-                    break
                 insn = _decode_insn_at(current_ea)
                 if insn is None:
                     next_ea = _next_head(current_ea, func_end)
@@ -1532,11 +1571,15 @@ def callees(
                     break
                 current_ea = next_ea
 
+            all_callees = list(callees_dict.values())
+            total = len(all_callees)
+            sliced = all_callees[offset : offset + limit]
             results.append(
                 {
                     "addr": fn_addr,
-                    "callees": list(callees_dict.values()),
-                    "more": more,
+                    "callees": sliced,
+                    "total": total,
+                    "more": offset + len(sliced) < total,
                 }
             )
         except Exception as e:
@@ -1556,15 +1599,15 @@ def find_bytes(
     patterns: Annotated[
         list[str] | str, "Byte patterns to search for (e.g. '48 8B ?? ??')"
     ],
-    limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
+    limit: Annotated[int, "Max matches per pattern (default: 100, max: 100)"] = 100,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindBytesResult]:
     """Search byte patterns (supports ??) with offset/limit pagination."""
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
-    if limit <= 0 or limit > 10000:
-        limit = 10000
+    if limit <= 0 or limit > 100:
+        limit = 100
 
     # Build a reusable search closure based on available IDA API
     def _make_searcher(pattern: str):
@@ -1643,16 +1686,16 @@ def find_bytes(
 def basic_blocks(
     addrs: Annotated[list[str] | str, "Function addresses or names to get basic blocks for (e.g. '0x123e', 'main')"],
     max_blocks: Annotated[
-        int, "Max basic blocks per function (default: 1000, max: 10000)"
-    ] = 1000,
+        int, "Max basic blocks per function (default: 100, max: 500)"
+    ] = 100,
     offset: Annotated[int, "Skip first N blocks (default: 0)"] = 0,
 ) -> list[BasicBlocksResult]:
     """Return function CFG blocks with offset/max_blocks pagination."""
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
-    if max_blocks <= 0 or max_blocks > 10000:
-        max_blocks = 10000
+    if max_blocks <= 0 or max_blocks > 500:
+        max_blocks = 500
 
     results = []
     for fn_addr in addrs:
@@ -1727,7 +1770,7 @@ def find(
     targets: Annotated[
         list[str | int] | str | int, "Search targets (strings, integers, or addresses)"
     ],
-    limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
+    limit: Annotated[int, "Max matches per target (default: 100, max: 100)"] = 100,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindResult]:
     """Search strings/immediates/refs for targets with offset/limit pagination."""
@@ -1735,8 +1778,8 @@ def find(
         targets = [targets]
 
     # Enforce max limit to prevent token overflow
-    if limit <= 0 or limit > 10000:
-        limit = 10000
+    if limit <= 0 or limit > 100:
+        limit = 100
 
     results = []
 
@@ -2115,7 +2158,7 @@ def insn_query(
             mnem = ""
 
         offset = _clamp_int(pattern.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(pattern.get("count", 100), 100, 0, 5000)
+        count = _clamp_int(pattern.get("count", 100), 100, 0, 100)
         max_scan_insns = _clamp_int(
             pattern.get("max_scan_insns", 200000), 200000, 1, 2_000_000
         )
@@ -2223,6 +2266,9 @@ def export_funcs(
     format: Annotated[
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
+    include_asm: Annotated[bool, "Include assembly in json format (default: false)"] = False,
+    include_code: Annotated[bool, "Include decompiled code in json format (default: true)"] = True,
+    include_xrefs: Annotated[bool, "Include xrefs in json format (default: false)"] = False,
 ) -> ExportFuncsJsonResult | ExportFuncsHeaderResult | ExportFuncsPrototypesResult:
     """Export function data for addresses in json/c_header/prototypes formats."""
     addrs = normalize_list_input(addrs)
@@ -2245,9 +2291,12 @@ def export_funcs(
             }
 
             if format == "json":
-                func_data["asm"] = get_assembly_lines(ea)
-                func_data["code"] = decompile_function_safe(ea)
-                func_data["xrefs"] = get_all_xrefs(ea)
+                if include_asm:
+                    func_data["asm"] = get_assembly_lines(ea)
+                if include_code:
+                    func_data["code"] = decompile_function_safe(ea)
+                if include_xrefs:
+                    func_data["xrefs"] = get_all_xrefs(ea)
 
             results.append(func_data)
 
@@ -2286,27 +2335,13 @@ def callgraph(
     roots: Annotated[
         list[str] | str, "Root function addresses to start call graph traversal from"
     ],
-    max_depth: Annotated[int, "Maximum depth for call graph traversal"] = 5,
-    max_nodes: Annotated[
-        int, "Max nodes across the graph (default: 1000, max: 100000)"
-    ] = 1000,
-    max_edges: Annotated[
-        int, "Max edges across the graph (default: 5000, max: 200000)"
-    ] = 5000,
-    max_edges_per_func: Annotated[
-        int, "Max edges per function (default: 200, max: 5000)"
-    ] = 200,
+    max_depth: Annotated[int, "Maximum depth for call graph traversal"],
+    max_nodes: Annotated[int, "Max nodes across the graph"],
+    max_edges: Annotated[int, "Max edges across the graph"],
+    max_edges_per_func: Annotated[int, "Max edges per function"],
 ) -> list[CallGraphResult]:
     """Build bounded callgraph from roots with depth/node/edge limits."""
     roots = normalize_list_input(roots)
-    if max_depth < 0:
-        max_depth = 0
-    if max_nodes <= 0 or max_nodes > 100000:
-        max_nodes = 100000
-    if max_edges <= 0 or max_edges > 200000:
-        max_edges = 200000
-    if max_edges_per_func <= 0 or max_edges_per_func > 5000:
-        max_edges_per_func = 5000
     results = []
 
     for root in roots:

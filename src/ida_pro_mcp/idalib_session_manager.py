@@ -1,309 +1,247 @@
-"""IDALib Session Manager - Multi-binary management for headless MCP server
+"""IDALib Session Manager — multi-process worker management via stdio IPC.
 
-This module provides session management for multiple IDA databases in idalib mode.
-Each session represents an opened binary with its own IDA database instance.
+Each binary runs in its own idalib worker subprocess.  Communication uses
+line-delimited JSON-RPC over stdin/stdout pipes (no network ports).  A
+per-worker lock serialises requests so multiple agents can safely share
+the same session manager.
 """
 
-import uuid
-import threading
+import json
 import logging
-from pathlib import Path
-from typing import Dict, Optional, Any
+import subprocess
+import sys
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-
-import idapro
-import ida_auto
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+_WORKER_SCRIPT = str(Path(__file__).parent / "idalib_worker.py")
+_READY_SENTINEL = "WORKER_READY"
+_ERROR_SENTINEL = "WORKER_ERROR"
+
 
 @dataclass
-class IDASession:
-    """Represents a single IDA database session"""
+class IDAWorkerSession:
+    """Represents a worker subprocess serving one IDA database."""
 
     session_id: str
     input_path: Path
+    process: subprocess.Popen
+    _lock: threading.Lock = field(default_factory=threading.Lock)
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
-    is_analyzing: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
     def to_dict(self) -> dict:
-        """Convert session to dictionary format"""
         return {
             "session_id": self.session_id,
             "input_path": str(self.input_path),
             "filename": self.input_path.name,
+            "alive": self.alive,
+            "pid": self.process.pid,
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
-            "is_analyzing": self.is_analyzing,
             "metadata": self.metadata,
         }
 
 
 class IDASessionManager:
-    """Manages multiple IDA database sessions for idalib mode.
+    """Manages idalib worker subprocesses communicating via stdio.
 
-    Design:
-    - `_sessions` stores all known session metadata.
-    - `_active_session_id` tracks the database currently opened in the idalib process.
-    - `_context_bindings` maps MCP transport context IDs to session IDs.
+    * ``open_binary()`` spawns a worker, waits for it to be ready, and
+      returns its ``session_id``.
+    * ``proxy_jsonrpc(session_id, method, params)`` sends a JSON-RPC
+      request to the worker via stdin and reads the response from stdout.
+    * ``close_session(session_id)`` terminates the worker.
     """
 
     def __init__(self):
-        self._sessions: Dict[str, IDASession] = {}
-        self._active_session_id: Optional[str] = None
-        self._context_bindings: Dict[str, str] = {}
+        self._sessions: Dict[str, IDAWorkerSession] = {}
         self._lock = threading.RLock()
-        logger.info("IDASessionManager initialized")
+        logger.info("IDASessionManager initialised")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def open_binary(
         self,
         input_path: Path | str,
-        run_auto_analysis: bool = True,
-        session_id: Optional[str] = None,
+        timeout: float = 120.0,
     ) -> str:
-        """Open a binary file and create a new session
-
-        Args:
-            input_path: Path to the binary file
-            run_auto_analysis: Whether to run auto-analysis
-            session_id: Optional custom session ID (auto-generated if not provided)
-
-        Returns:
-            Session ID for the opened binary
-
-        Raises:
-            FileNotFoundError: If the input file doesn't exist
-            RuntimeError: If failed to open the database
-        """
+        """Spawn a worker for *input_path* and return the session ID."""
         input_path = Path(input_path)
-
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
         with self._lock:
-            # Check if this file is already tracked
+            # Re-use existing session for the same binary
             for sid, session in self._sessions.items():
                 if session.input_path.resolve() == input_path.resolve():
-                    logger.info(f"Binary already open in session: {sid}")
-                    session.last_accessed = datetime.now()
-                    return sid
+                    if session.alive:
+                        logger.info("Binary already open in session %s", sid)
+                        session.last_accessed = datetime.now()
+                        return sid
+                    else:
+                        logger.warning("Stale session %s, re-spawning", sid)
+                        self._sessions.pop(sid)
+                        break
 
-            # Generate session ID
-            if session_id is None:
-                session_id = str(uuid.uuid4())[:8]
-            elif session_id in self._sessions:
-                raise ValueError(f"Session already exists: {session_id}")
+            session_id = str(uuid.uuid4())[:8]
 
-            # Open the database
-            logger.info(f"Opening database: {input_path} (session: {session_id})")
-            self._activate_database_path(str(input_path), run_auto_analysis)
+        # Spawn outside the lock to avoid blocking other operations.
+        worker = self._spawn_worker(input_path, timeout)
 
-            # Create session object
-            session = IDASession(
+        with self._lock:
+            session = IDAWorkerSession(
                 session_id=session_id,
                 input_path=input_path,
-                is_analyzing=run_auto_analysis,
+                process=worker,
             )
-
             self._sessions[session_id] = session
-            self._active_session_id = session_id
 
-            # Wait for analysis if requested
-            if run_auto_analysis:
-                logger.debug(
-                    f"Waiting for auto-analysis to complete (session: {session_id})"
-                )
-                ida_auto.auto_wait()
-                session.is_analyzing = False
-                logger.info(f"Auto-analysis completed (session: {session_id})")
-
-            logger.info(f"Session created: {session_id} for {input_path.name}")
-            return session_id
+        logger.info(
+            "Session %s ready: %s (pid %d)",
+            session_id,
+            input_path.name,
+            worker.pid,
+        )
+        return session_id
 
     def close_session(self, session_id: str) -> bool:
-        """Close a specific session and its database
-
-        Args:
-            session_id: Session ID to close
-
-        Returns:
-            True if closed successfully, False if session not found
-        """
         with self._lock:
-            if session_id not in self._sessions:
-                logger.warning(f"Session not found: {session_id}")
-                return False
+            session = self._sessions.pop(session_id, None)
+        if session is None:
+            return False
+        self._terminate_worker(session)
+        logger.info("Session closed: %s", session_id)
+        return True
 
-            session = self._sessions[session_id]
-            logger.info(f"Closing session: {session_id} ({session.input_path.name})")
-
-            # If this is the active in-process database, close it.
-            if self._active_session_id == session_id:
-                idapro.close_database()
-                self._active_session_id = None
-
-            # Remove session
-            del self._sessions[session_id]
-            self._unbind_session_everywhere_locked(session_id)
-            logger.info(f"Session closed: {session_id}")
-            return True
-
-    def bind_context(
-        self, context_id: str, session_id: str, activate: bool = False
-    ) -> IDASession:
-        """Bind a transport context to a session.
-
-        Args:
-            context_id: Transport-specific context identifier.
-            session_id: IDA session ID to bind.
-            activate: Whether to activate the bound session immediately.
-
-        Returns:
-            The bound session object.
-        """
+    def proxy_jsonrpc(self, session_id: str, method: str, params: dict) -> dict:
+        """Send a JSON-RPC request to a worker and return the parsed response."""
         with self._lock:
-            if session_id not in self._sessions:
-                raise ValueError(f"Session not found: {session_id}")
-
-            self._context_bindings[context_id] = session_id
-            session = self._sessions[session_id]
-            session.last_accessed = datetime.now()
-            logger.info("Bound context %s -> session %s", context_id, session_id)
-
-            if activate:
-                self._activate_session_locked(session_id)
-            return session
-
-    def unbind_context(self, context_id: str) -> bool:
-        """Remove an existing context binding."""
-        with self._lock:
-            removed = self._context_bindings.pop(context_id, None)
-            if removed is None:
-                return False
-            logger.info("Unbound context %s from session %s", context_id, removed)
-            return True
-
-    def get_context_session_id(self, context_id: str) -> Optional[str]:
-        """Return the session ID bound to a context."""
-        with self._lock:
-            return self._context_bindings.get(context_id)
-
-    def get_context_session(self, context_id: str) -> Optional[IDASession]:
-        """Get the session object bound to a context."""
-        with self._lock:
-            session_id = self._context_bindings.get(context_id)
-            if session_id is None:
-                return None
-            return self._sessions.get(session_id)
-
-    def activate_context(self, context_id: str) -> IDASession:
-        """Activate the database bound to a context for the current request."""
-        with self._lock:
-            session_id = self._context_bindings.get(context_id)
-            if session_id is None:
-                raise RuntimeError(
-                    "No session bound for this context. "
-                    "Use idalib_switch(session_id) or idalib_open(...) first."
-                )
             session = self._sessions.get(session_id)
-            if session is None:
-                self._context_bindings.pop(context_id, None)
-                raise RuntimeError(
-                    f"Context binding is stale (missing session: {session_id}). "
-                    "Bind to a valid session again."
-                )
-
-            self._activate_session_locked(session_id)
-            session.last_accessed = datetime.now()
-            return session
-
-    def list_sessions(self, context_id: Optional[str] = None) -> list[dict]:
-        """List all open sessions with binding and activation metadata."""
-        with self._lock:
-            context_session_id = self._context_bindings.get(context_id, None)
-            binding_counts: Dict[str, int] = {}
-            for bound_session_id in self._context_bindings.values():
-                binding_counts[bound_session_id] = (
-                    binding_counts.get(bound_session_id, 0) + 1
-                )
-
-            return [
-                {
-                    **session.to_dict(),
-                    "is_active": session.session_id == self._active_session_id,
-                    "is_current_context": session.session_id == context_session_id,
-                    "bound_contexts": binding_counts.get(session.session_id, 0),
-                }
-                for session in self._sessions.values()
-            ]
-
-    def get_session(self, session_id: str) -> Optional[IDASession]:
-        """Get a specific session by ID
-
-        Args:
-            session_id: Session ID to retrieve
-
-        Returns:
-            Session object or None if not found
-        """
-        with self._lock:
-            return self._sessions.get(session_id)
-
-    def close_all_sessions(self):
-        """Close all sessions and databases"""
-        with self._lock:
-            logger.info(f"Closing all {len(self._sessions)} sessions")
-
-            if self._active_session_id is not None:
-                idapro.close_database()
-                self._active_session_id = None
-
-            self._sessions.clear()
-            self._context_bindings.clear()
-            logger.info("All sessions closed")
-
-    def _activate_session_locked(self, session_id: str) -> None:
-        if self._active_session_id == session_id:
-            return
-        session = self._sessions.get(session_id)
         if session is None:
             raise ValueError(f"Session not found: {session_id}")
-        self._activate_database_path(str(session.input_path), run_auto_analysis=False)
-        self._active_session_id = session_id
-        logger.info("Activated session %s (%s)", session_id, session.input_path.name)
+        if not session.alive:
+            raise RuntimeError(
+                f"Worker for session {session_id} is dead (pid {session.process.pid}). "
+                "Close and re-open the binary."
+            )
+        session.last_accessed = datetime.now()
 
-    def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> None:
-        if self._active_session_id is not None:
-            logger.debug("Closing active database before opening %s", input_path)
-            idapro.close_database()
-            self._active_session_id = None
+        request_line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        ).encode() + b"\n"
 
-        if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
-            raise RuntimeError(f"Failed to open database: {input_path}")
+        with session._lock:
+            try:
+                session.process.stdin.write(request_line)
+                session.process.stdin.flush()
+                response_line = session.process.stdout.readline()
+            except (BrokenPipeError, OSError) as e:
+                raise RuntimeError(
+                    f"Worker pipe broken for session {session_id}: {e}"
+                ) from e
 
-    def _unbind_session_everywhere_locked(self, session_id: str) -> None:
-        stale_contexts = [
-            context_id
-            for context_id, bound_session_id in self._context_bindings.items()
-            if bound_session_id == session_id
-        ]
-        for context_id in stale_contexts:
-            del self._context_bindings[context_id]
+        if not response_line:
+            raise RuntimeError(
+                f"Worker for session {session_id} closed unexpectedly"
+            )
+        return json.loads(response_line)
+
+    def get_session(self, session_id: str) -> Optional[IDAWorkerSession]:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def list_sessions(self) -> list[dict]:
+        with self._lock:
+            return [s.to_dict() for s in self._sessions.values()]
+
+    def close_all_sessions(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            self._terminate_worker(session)
+        logger.info("All sessions closed")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _spawn_worker(self, input_path: Path, timeout: float) -> subprocess.Popen:
+        cmd = [sys.executable, _WORKER_SCRIPT, str(input_path)]
+        logger.info("Spawning worker: %s", " ".join(cmd))
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # inherit parent stderr → journal / terminal
+        )
+
+        # Wait for the WORKER_READY sentinel on stdout.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"Worker exited with code {proc.returncode} for {input_path}"
+                )
+
+            line = proc.stdout.readline().decode().strip()
+            if line == _READY_SENTINEL:
+                return proc
+            if line.startswith(_ERROR_SENTINEL):
+                proc.kill()
+                raise RuntimeError(line.split(":", 1)[1])
+
+            time.sleep(0.2)
+
+        proc.kill()
+        raise RuntimeError(
+            f"Worker did not become ready within {timeout}s for {input_path}"
+        )
+
+    @staticmethod
+    def _terminate_worker(session: IDAWorkerSession) -> None:
+        proc = session.process
+        if proc.poll() is not None:
+            return
+        logger.info(
+            "Terminating worker pid %d (session %s)", proc.pid, session.session_id
+        )
+        # Close stdin to signal the worker's stdio loop to exit.
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        # Then send SIGTERM for the graceful close_database() handler.
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Worker pid %d did not exit, killing", proc.pid)
+            proc.kill()
 
 
-# Global session manager instance
+# ------------------------------------------------------------------
+# Singleton
+# ------------------------------------------------------------------
+
 _session_manager: Optional[IDASessionManager] = None
 
 
 def get_session_manager() -> IDASessionManager:
-    """Get the global session manager instance
-
-    Returns:
-        Global IDASessionManager instance
-    """
     global _session_manager
     if _session_manager is None:
         _session_manager = IDASessionManager()

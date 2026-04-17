@@ -519,18 +519,18 @@ def int_convert(
 @idasync
 def list_funcs(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
     """List functions with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(queries, lambda s: {"offset": 0, "count": 100, "filter": s})
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
     results = []
     for query in queries:
         offset = query.get("offset", 0)
-        count = query.get("count", 100)
+        count = min(query.get("count", 100) or 100, 100)
         filter_pattern = query.get("filter", "")
 
         # Treat empty/"*" filter as "all"
@@ -552,7 +552,7 @@ def func_query(
     ],
 ) -> list[FunctionQueryPage]:
     """Query functions with richer filtering than list_funcs."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(queries, lambda s: {"offset": 0, "count": 100, "filter": s})
 
     all_functions: list[dict] = []
     for addr in idautils.Functions():
@@ -584,7 +584,7 @@ def func_query(
     results = []
     for query in queries:
         offset = query.get("offset", 0)
-        count = query.get("count", 50)
+        count = query.get("count", 100)
         sort_by = query.get("sort_by", "addr")
         descending = bool(query.get("descending", False))
         if sort_by not in ("addr", "name", "size"):
@@ -629,12 +629,12 @@ def func_query(
 @idasync
 def list_globals(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
     """List globals with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(queries, lambda s: {"offset": 0, "count": 100, "filter": s})
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
         if not idaapi.get_func(addr) and name is not None:
@@ -643,7 +643,7 @@ def list_globals(
     results = []
     for query in queries:
         offset = query.get("offset", 0)
-        count = query.get("count", 100)
+        count = min(query.get("count", 100) or 100, 100)
         filter_pattern = query.get("filter", "")
 
         # Treat empty/"*" filter as "all"
@@ -764,10 +764,11 @@ def entity_query(
 @tool
 @idasync
 def imports(
-    offset: Annotated[int, "Starting pagination index (default: 0)"],
-    count: Annotated[int, "Maximum rows (0 returns all imports)"],
+    offset: Annotated[int, "Starting pagination index (default: 0)"] = 0,
+    count: Annotated[int, "Max results (default: 100, max: 100)"] = 100,
 ) -> Page[Import]:
     """List imports with module names using offset/count pagination."""
+    count = min(count or 100, 100)
     return paginate(_collect_imports(), offset, count)
 
 
@@ -827,14 +828,14 @@ def idb_save(
 @idasync
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
-    limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
+    limit: Annotated[int, "Max matches (default: 30, max: 100)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> FindRegexResult:
     """Search strings by case-insensitive regex with offset/limit pagination."""
     if limit <= 0:
         limit = 30
-    if limit > 500:
-        limit = 500
+    if limit > 100:
+        limit = 100
 
     matches = []
     regex = re.compile(pattern, re.IGNORECASE)

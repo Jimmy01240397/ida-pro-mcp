@@ -171,7 +171,7 @@ class XrefQuery(TypedDict):
     direction: NotRequired[Annotated[str, "to|from|both (default: both)"]]
     xref_type: NotRequired[Annotated[str, "any|code|data (default: any)"]]
     offset: NotRequired[Annotated[int, "Start index (default: 0)"]]
-    count: NotRequired[Annotated[int, "Max results (default: 200, max: 5000)"]]
+    count: NotRequired[Annotated[int, "Max results (default: 100, max: 100)"]]
     include_fn: NotRequired[Annotated[bool, "Include function metadata"]]
     dedup: NotRequired[Annotated[bool, "Deduplicate by addr/type"]]
     sort_by: NotRequired[Annotated[str, "Sort: addr|type"]]
@@ -183,7 +183,7 @@ class ListQuery(TypedDict, total=False):
 
     filter: Annotated[str, "Glob filter"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max results (0=all)"]
+    count: Annotated[int, "Max results (default: 100, max: 100)"]
 
 
 class FunctionQuery(TypedDict, total=False):
@@ -195,7 +195,7 @@ class FunctionQuery(TypedDict, total=False):
     max_size: Annotated[int, "Max size in bytes"]
     has_type: Annotated[bool, "Require type info"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max results (0=all)"]
+    count: Annotated[int, "Max results (default: 100, max: 100)"]
     sort_by: Annotated[str, "Sort: addr|name|size"]
     descending: Annotated[bool, "Descending"]
 
@@ -211,7 +211,7 @@ class EntityQuery(TypedDict):
     segment: NotRequired[Annotated[str, "Segment filter"]]
     module: NotRequired[Annotated[str, "Import module filter"]]
     offset: NotRequired[Annotated[int, "Start index"]]
-    count: NotRequired[Annotated[int, "Max results (0=all)"]]
+    count: NotRequired[Annotated[int, "Max results (default: 100, max: 100)"]]
     sort_by: NotRequired[Annotated[str, "Sort: addr|name|size|length"]]
     descending: NotRequired[Annotated[bool, "Descending"]]
     fields: NotRequired[Annotated[list[str], "Projection field list"]]
@@ -226,7 +226,7 @@ class FuncProfileQuery(TypedDict, total=False):
     addr: Annotated[str, "Function address or name (omit or '*' for all)"]
     filter: Annotated[str, "Name glob/regex"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max results (0=all)"]
+    count: Annotated[int, "Max results (default: 100, max: 100)"]
     sort_by: Annotated[str, "Sort: addr|name|size"]
     descending: Annotated[bool, "Descending"]
     include_lists: Annotated[bool, "Include callers/callees/strings/constants"]
@@ -253,6 +253,11 @@ class AnalyzeBatchQuery(TypedDict):
     max_strings: NotRequired[Annotated[int, "Max strings"]]
     max_constants: NotRequired[Annotated[int, "Max constants"]]
     max_blocks: NotRequired[Annotated[int, "Max blocks"]]
+    offset_callers: NotRequired[Annotated[int, "Skip first N callers"]]
+    offset_callees: NotRequired[Annotated[int, "Skip first N callees"]]
+    offset_strings: NotRequired[Annotated[int, "Skip first N strings"]]
+    offset_constants: NotRequired[Annotated[int, "Skip first N constants"]]
+    offset_blocks: NotRequired[Annotated[int, "Skip first N blocks"]]
 
 
 class ImportQuery(TypedDict, total=False):
@@ -261,7 +266,7 @@ class ImportQuery(TypedDict, total=False):
     filter: Annotated[str, "Name glob/regex"]
     module: Annotated[str, "Module glob/regex"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max results (0=all)"]
+    count: Annotated[int, "Max results (default: 100, max: 100)"]
 
 
 class TypeInspectQuery(TypedDict):
@@ -278,7 +283,7 @@ class TypeQuery(TypedDict, total=False):
     filter: Annotated[str, "Name glob/regex"]
     kind: Annotated[str, "any|struct|union|enum|typedef|func|ptr|udt"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max results (0=all)"]
+    count: Annotated[int, "Max results (default: 100, max: 100)"]
     sort_by: Annotated[str, "Sort: name|size|ordinal"]
     descending: Annotated[bool, "Descending"]
     include_decl: Annotated[bool, "Include declaration text"]
@@ -307,7 +312,7 @@ class InsnPattern(TypedDict, total=False):
     start: Annotated[str, "Scope: start address"]
     end: Annotated[str, "Scope: end address (exclusive)"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max matches (max: 5000)"]
+    count: Annotated[int, "Max matches (default: 100, max: 100)"]
     max_scan_insns: Annotated[int, "Max instructions to scan"]
     include_fn: Annotated[bool, "Include function metadata"]
     include_disasm: Annotated[bool, "Include disassembly text"]
@@ -566,6 +571,7 @@ T = TypeVar("T")
 
 class Page(TypedDict, Generic[T]):
     data: list[T]
+    total: int
     next_offset: Optional[int]
 
 
@@ -893,13 +899,16 @@ def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
 
 
 def paginate(data: list[T], offset: int, count: int) -> Page[T]:
-    if count == 0:
-        count = len(data)
-    next_offset = offset + count
-    if next_offset >= len(data):
-        next_offset = None
+    total = len(data)
+    if count <= 0:
+        count = 100
+    if count > 100:
+        count = 100
+    end = offset + count
+    next_offset = end if end < total else None
     return {
-        "data": data[offset : offset + count],
+        "data": data[offset:end],
+        "total": total,
         "next_offset": next_offset,
     }
 
@@ -1242,16 +1251,13 @@ def get_callees(addr: str) -> list[dict]:
         return []
 
 
-def get_callers(addr: str, limit: int = 50) -> list[Function]:
-    """Get callers for a single function address"""
+def get_callers(
+    addr: str, limit: int = 50, offset: int = 0
+) -> tuple[list[Function], int]:
+    """Get callers with offset/limit. Returns (callers, total)."""
     try:
         callers = {}
-        iterations = 0
-        max_iterations = limit * 100
         for caller_addr in idautils.CodeRefsTo(parse_address(addr), 0):
-            iterations += 1
-            if len(callers) >= limit or iterations >= max_iterations:
-                break
             func = get_function(caller_addr, raise_error=False)
             if not func:
                 continue
@@ -1265,9 +1271,11 @@ def get_callers(addr: str, limit: int = 50) -> list[Function]:
                 continue
             callers[func["addr"]] = func
 
-        return list(callers.values())
+        all_callers = list(callers.values())
+        total = len(all_callers)
+        return all_callers[offset : offset + limit], total
     except Exception:
-        return []
+        return [], 0
 
 
 def get_xrefs_from_internal(ea: int) -> list[Xref]:
