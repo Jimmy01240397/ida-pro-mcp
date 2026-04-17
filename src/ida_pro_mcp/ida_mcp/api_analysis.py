@@ -801,8 +801,10 @@ def disasm(
 ) -> DisasmResult:
     """Disassemble function with offset/max_instructions pagination and optional total count."""
 
-    # Enforce max limit
-    if max_instructions <= 0 or max_instructions > 500:
+    # Enforce limits
+    if max_instructions <= 0:
+        max_instructions = 100
+    if max_instructions > 500:
         max_instructions = 500
     if offset < 0:
         offset = 0
@@ -1246,7 +1248,9 @@ def xrefs_to(
     """Return xrefs to address(es) or named symbols, capped per target with truncation flag."""
     addrs = normalize_list_input(addrs)
 
-    if limit <= 0 or limit > 100:
+    if limit <= 0:
+        limit = 100
+    if limit > 100:
         limit = 100
 
     results = []
@@ -1520,7 +1524,9 @@ def callees(
     """Return unique callees per function, capped by limit."""
     addrs = normalize_list_input(addrs)
 
-    if limit <= 0 or limit > 100:
+    if limit <= 0:
+        limit = 100
+    if limit > 100:
         limit = 100
 
     results = []
@@ -1606,7 +1612,9 @@ def find_bytes(
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
-    if limit <= 0 or limit > 100:
+    if limit <= 0:
+        limit = 100
+    if limit > 100:
         limit = 100
 
     # Build a reusable search closure based on available IDA API
@@ -1694,7 +1702,9 @@ def basic_blocks(
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
-    if max_blocks <= 0 or max_blocks > 500:
+    if max_blocks <= 0:
+        max_blocks = 100
+    if max_blocks > 500:
         max_blocks = 500
 
     results = []
@@ -1778,7 +1788,9 @@ def find(
         targets = [targets]
 
     # Enforce max limit to prevent token overflow
-    if limit <= 0 or limit > 100:
+    if limit <= 0:
+        limit = 100
+    if limit > 100:
         limit = 100
 
     results = []

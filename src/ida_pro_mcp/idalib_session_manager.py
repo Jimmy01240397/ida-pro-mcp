@@ -8,6 +8,8 @@ the same session manager.
 
 import json
 import logging
+import os
+import select
 import subprocess
 import sys
 import threading
@@ -96,12 +98,10 @@ class IDASessionManager:
                         self._sessions.pop(sid)
                         break
 
+            # Hold the lock through spawn to prevent duplicate workers
+            # for the same binary from concurrent callers.
             session_id = str(uuid.uuid4())[:8]
-
-        # Spawn outside the lock to avoid blocking other operations.
-        worker = self._spawn_worker(input_path, timeout)
-
-        with self._lock:
+            worker = self._spawn_worker(input_path, timeout)
             session = IDAWorkerSession(
                 session_id=session_id,
                 input_path=input_path,
@@ -130,14 +130,14 @@ class IDASessionManager:
         """Send a JSON-RPC request to a worker and return the parsed response."""
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None:
-            raise ValueError(f"Session not found: {session_id}")
-        if not session.alive:
-            raise RuntimeError(
-                f"Worker for session {session_id} is dead (pid {session.process.pid}). "
-                "Close and re-open the binary."
-            )
-        session.last_accessed = datetime.now()
+            if session is None:
+                raise ValueError(f"Session not found: {session_id}")
+            if not session.alive:
+                raise RuntimeError(
+                    f"Worker for session {session_id} is dead (pid {session.process.pid}). "
+                    "Close and re-open the binary."
+                )
+            session.last_accessed = datetime.now()
 
         request_line = json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -191,21 +191,35 @@ class IDASessionManager:
         )
 
         # Wait for the WORKER_READY sentinel on stdout.
+        # Use select() so readline() never blocks past the deadline.
         deadline = time.monotonic() + timeout
+        stdout_fd = proc.stdout.fileno()
+        buf = b""
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"Worker exited with code {proc.returncode} for {input_path}"
                 )
 
-            line = proc.stdout.readline().decode().strip()
-            if line == _READY_SENTINEL:
-                return proc
-            if line.startswith(_ERROR_SENTINEL):
-                proc.kill()
-                raise RuntimeError(line.split(":", 1)[1])
+            remaining = max(0.1, deadline - time.monotonic())
+            ready, _, _ = select.select([stdout_fd], [], [], min(remaining, 1.0))
+            if not ready:
+                continue
 
-            time.sleep(0.2)
+            chunk = os.read(stdout_fd, 4096)
+            if not chunk:
+                raise RuntimeError(
+                    f"Worker stdout closed unexpectedly for {input_path}"
+                )
+            buf += chunk
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode().strip()
+                if line == _READY_SENTINEL:
+                    return proc
+                if line.startswith(_ERROR_SENTINEL):
+                    proc.kill()
+                    raise RuntimeError(line.split(":", 1)[1])
 
         proc.kill()
         raise RuntimeError(
@@ -239,10 +253,13 @@ class IDASessionManager:
 # ------------------------------------------------------------------
 
 _session_manager: Optional[IDASessionManager] = None
+_session_manager_lock = threading.Lock()
 
 
 def get_session_manager() -> IDASessionManager:
     global _session_manager
     if _session_manager is None:
-        _session_manager = IDASessionManager()
+        with _session_manager_lock:
+            if _session_manager is None:
+                _session_manager = IDASessionManager()
     return _session_manager
