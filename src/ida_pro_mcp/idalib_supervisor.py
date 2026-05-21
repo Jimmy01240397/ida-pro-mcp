@@ -731,7 +731,11 @@ class IdalibSupervisor:
         requested_session_id = session_id
 
         with self._lock:
-            # 1. Live session for this path → reuse with hand-off.
+            # 1. Live session for this path → reuse. The bind here is
+            # a single dict mutation already protected by state lock;
+            # no need to take session.lock (we don't touch the worker
+            # at all). A concurrent close's pop-after-save count will
+            # see this binding and naturally back out of terminate.
             existing_sid = self.path_to_session.get(path_key)
             if existing_sid is not None:
                 session = self.sessions.get(existing_sid)
@@ -741,18 +745,9 @@ class IdalibSupervisor:
                             f"Binary already open as session '{existing_sid}', cannot reuse "
                             f"different session_id '{requested_session_id}'."
                         )
-                    # State→session hand-off: acquire session.lock
-                    # under the state lock so the session ref is
-                    # guaranteed valid for the bind below. Releasing
-                    # session.lock back here is fine — the bind has
-                    # already updated context_bindings under state.
-                    session.lock.acquire()
-                    try:
-                        session.last_accessed = datetime.now()
-                        if context_id is not None:
-                            self.bind_context(context_id, existing_sid)
-                    finally:
-                        session.lock.release()
+                    session.last_accessed = datetime.now()
+                    if context_id is not None:
+                        self.bind_context(context_id, existing_sid)
                     return session
                 # Stale — drop it before starting fresh.
                 self._unregister_session_locked(existing_sid)
@@ -811,17 +806,12 @@ class IdalibSupervisor:
                 raise pending.error
             session = self.sessions.get(pending.session_id)
             if session is not None and session.is_alive():
-                # State→session hand-off for the late-arrival bind:
-                # acquire session.lock under state so a concurrent
-                # close can't terminate the session between this
-                # check and the bind.
-                session.lock.acquire()
-                try:
-                    if context_id and self.context_bindings.get(context_id) != session.session_id:
-                        self.bind_context(context_id, session.session_id)
-                    session.last_accessed = datetime.now()
-                finally:
-                    session.lock.release()
+                # Late-arrival bind is just a state-dict mutation;
+                # state lock is enough (same reasoning as the live-
+                # session path above).
+                if context_id and self.context_bindings.get(context_id) != session.session_id:
+                    self.bind_context(context_id, session.session_id)
+                session.last_accessed = datetime.now()
                 return session
             return pending.to_status_dict()
 
@@ -1539,17 +1529,17 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        # Hand-off: resolve session + acquire its lock atomically, so a
-        # concurrent close can't terminate the session between resolve
-        # and bind.
-        with sup.session_scope(session_id) as session:
-            sup.bind_context(context_id, session.session_id)
-            return {
-                "success": True,
-                **sup.context_fields(context_id),
-                "session": session.to_dict(),
-                "message": f"Bound context to session: {session.session_id} ({session.filename})",
-            }
+        # Bind is a single state-dict mutation; resolve_session +
+        # bind_context both serialise on state lock alone, no
+        # session.lock needed (we never touch the worker).
+        session = sup.resolve_session(session_id)
+        sup.bind_context(context_id, session.session_id)
+        return {
+            "success": True,
+            **sup.context_fields(context_id),
+            "session": session.to_dict(),
+            "message": f"Bound context to session: {session.session_id} ({session.filename})",
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1604,8 +1594,9 @@ def idalib_current() -> IdalibCurrentResult:
                 "error": "No session bound for this context. Use idalib_open(...) or idalib_switch(session_id) first.",
                 **sup.context_fields(context_id),
             }
-        with sup.session_scope(session_id) as session:
-            return {**session.to_dict(), **sup.context_fields(context_id)}
+        # Read-only metadata snapshot; state lock alone is enough.
+        session = sup.resolve_session(session_id)
+        return {**session.to_dict(), **sup.context_fields(context_id)}
     except Exception as e:
         return {"error": f"Failed to get current session: {e}"}
 
