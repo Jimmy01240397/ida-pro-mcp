@@ -1,3 +1,4 @@
+import hashlib
 import re
 import select
 import socket
@@ -69,6 +70,28 @@ class _McpSseConnection:
         except (BrokenPipeError, OSError):
             self.alive = False
             return False
+
+
+ANONYMOUS_AGENT_ID = "anonymous"
+
+
+def _agent_id_from_auth_header(auth_header: str | None) -> str:
+    """Hash the Bearer token to a short stable agent id, or ANONYMOUS_AGENT_ID.
+
+    Any HTTP client can send ``Authorization: Bearer <token>``; agents
+    using the same token share an agent identity, agents using
+    different tokens are isolated.  We hash the token so the raw value
+    never lands in logs or response bodies.
+    """
+    if not auth_header:
+        return ANONYMOUS_AGENT_ID
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return ANONYMOUS_AGENT_ID
+    token = parts[1].strip()
+    if not token:
+        return ANONYMOUS_AGENT_ID
+    return "agent_" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
 def _origin_allowed_by_policy(
@@ -446,6 +469,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)
         setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
+        setattr(
+            self.mcp_server._agent_id,
+            "data",
+            _agent_id_from_auth_header(self.headers.get("Authorization")),
+        )
         set_current_request_external_base_url(
             _derive_external_base_url(
                 self.headers,
@@ -462,6 +490,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             setattr(self.mcp_server._enabled_extensions, "data", set())
             setattr(self.mcp_server._protocol_version, "data", None)
             setattr(self.mcp_server._transport_session_id, "data", None)
+            setattr(self.mcp_server._agent_id, "data", ANONYMOUS_AGENT_ID)
             set_current_request_external_base_url(None)
 
         # Send SSE response if necessary
@@ -516,6 +545,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             "data",
             f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
         )
+        setattr(
+            self.mcp_server._agent_id,
+            "data",
+            _agent_id_from_auth_header(self.headers.get("Authorization")),
+        )
         set_current_request_external_base_url(
             _derive_external_base_url(
                 self.headers,
@@ -532,6 +566,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             setattr(self.mcp_server._enabled_extensions, "data", set())
             setattr(self.mcp_server._protocol_version, "data", None)
             setattr(self.mcp_server._transport_session_id, "data", None)
+            setattr(self.mcp_server._agent_id, "data", ANONYMOUS_AGENT_ID)
             set_current_request_external_base_url(None)
 
         def send_response(status: int, body: bytes):
@@ -571,6 +606,7 @@ class McpServer:
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
         self._enabled_extensions = threading.local()  # set[str] per request
+        self._agent_id = threading.local()  # str per request (hashed Bearer token)
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
 
@@ -713,6 +749,17 @@ class McpServer:
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
+
+    def get_current_agent_id(self) -> str:
+        """Return the hashed Bearer token for the current request.
+
+        Returns :data:`ANONYMOUS_AGENT_ID` when no ``Authorization: Bearer``
+        header was provided so clients that don't authenticate keep
+        working — they all share the anonymous bucket.  Two clients
+        sending the same Bearer token resolve to the same agent id;
+        different tokens resolve to different ids.
+        """
+        return getattr(self._agent_id, "data", ANONYMOUS_AGENT_ID) or ANONYMOUS_AGENT_ID
 
     def _prune_http_sessions_locked(self, now: float) -> None:
         if self.http_session_ttl_sec > 0:
