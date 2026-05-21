@@ -526,3 +526,364 @@ def test_closed_gui_session_does_not_reappear_if_closed_during_headless_fallback
         assert sup.spawned[-1].process.returncode == 0
     finally:
         restore()
+
+
+# ---------------------------------------------------------------------------
+# Bearer-token agent isolation + --bearer-contexts mode
+# ---------------------------------------------------------------------------
+
+
+class _BearerMcp:
+    """McpServer stand-in that lets tests dial Bearer/transport state."""
+
+    def __init__(self, agent_id="anonymous", session_id=None):
+        self._agent = agent_id
+        self._session = session_id
+
+    def get_current_agent_id(self):
+        return self._agent
+
+    def get_current_transport_session_id(self):
+        return self._session
+
+
+def test_bearer_token_helper_hashes_consistently():
+    # Import via the same path-trick the supervisor uses so we don't
+    # trigger ida_mcp/__init__.py (which would import idaapi).
+    pkg_dir = Path(supmod.__file__).resolve().parent / "ida_mcp"
+    sys.path.insert(0, str(pkg_dir))
+    try:
+        from zeromcp.mcp import (  # type: ignore[import-not-found]
+            ANONYMOUS_AGENT_ID,
+            _agent_id_from_auth_header,
+        )
+    finally:
+        sys.path.remove(str(pkg_dir))
+
+    assert _agent_id_from_auth_header(None) == ANONYMOUS_AGENT_ID
+    assert _agent_id_from_auth_header("") == ANONYMOUS_AGENT_ID
+    assert _agent_id_from_auth_header("Bearer ") == ANONYMOUS_AGENT_ID
+    assert _agent_id_from_auth_header("Basic abc") == ANONYMOUS_AGENT_ID
+
+    a1 = _agent_id_from_auth_header("Bearer alpha")
+    a2 = _agent_id_from_auth_header("Bearer alpha")
+    b = _agent_id_from_auth_header("Bearer beta")
+    assert a1 == a2
+    assert a1 != b
+    assert a1.startswith("agent_")
+
+
+def test_resolve_context_id_no_flags_no_bearer_returns_shared_fallback():
+    sup = supmod.IdalibSupervisor(_BearerMcp())
+    assert sup.resolve_context_id() == supmod.SHARED_FALLBACK_CONTEXT_ID
+
+
+def test_resolve_context_id_uses_bearer_when_header_present_even_without_flag():
+    sup = supmod.IdalibSupervisor(_BearerMcp(agent_id="agent_alice"))
+    assert sup.resolve_context_id() == "bearer:agent_alice"
+
+
+def test_resolve_context_id_bearer_contexts_flag_requires_header():
+    sup = supmod.IdalibSupervisor(_BearerMcp(), bearer_contexts=True)
+    try:
+        sup.resolve_context_id()
+    except RuntimeError as e:
+        assert "Authorization: Bearer" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_resolve_context_id_isolated_uses_transport_session_when_no_bearer():
+    sup = supmod.IdalibSupervisor(
+        _BearerMcp(session_id="http:abc"), isolated_contexts=True
+    )
+    assert sup.resolve_context_id() == "http:abc"
+
+
+def test_resolve_context_id_bearer_wins_over_isolated_when_both_set():
+    sup = supmod.IdalibSupervisor(
+        _BearerMcp(agent_id="agent_alice", session_id="http:abc"),
+        isolated_contexts=True,
+        bearer_contexts=True,
+    )
+    assert sup.resolve_context_id() == "bearer:agent_alice"
+
+
+def test_context_fields_surfaces_bearer_state():
+    mcp = _BearerMcp(agent_id="agent_alice", session_id="http:abc")
+    sup = supmod.IdalibSupervisor(mcp, bearer_contexts=True)
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["context_id"] == "bearer:agent_alice"
+    assert fields["agent_id"] == "agent_alice"
+    assert fields["bearer_contexts"] is True
+
+
+# ---------------------------------------------------------------------------
+# Refcount-aware close + auto-save before terminate
+# ---------------------------------------------------------------------------
+
+
+def _make_saving_sup():
+    """A FakeSupervisor whose save call is captured for assertions."""
+
+    class _SavingFakeSupervisor(_FakeSupervisor):
+        def __init__(self):
+            super().__init__()
+            self.save_calls: list[tuple[str, str]] = []
+
+        def call_worker_tool(self, worker, name, arguments=None):
+            if name in {"idalib_save", "idb_save"}:
+                self.save_calls.append((name, (arguments or {}).get("path", "")))
+                return {"ok": True, "path": "/tmp/x.i64"}
+            return super().call_worker_tool(worker, name, arguments)
+
+    return _SavingFakeSupervisor()
+
+
+def test_release_session_with_other_refs_keeps_worker_alive(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _make_saving_sup()
+    sup.open_session(str(sample), session_id="shared", context_id="ctxA")
+    sup.bind_context("ctxB", "shared")
+
+    outcome = sup.release_session("shared", "ctxA")
+    assert outcome == {
+        "success": True,
+        "released": True,
+        "terminated": False,
+        "remaining_refs": 1,
+        "saved": True,
+        "save_error": None,
+    }
+    assert "shared" in sup.sessions
+    assert sup.context_bindings == {"ctxB": "shared"}
+    assert sup.save_calls == [("idalib_save", "")]
+
+
+def test_release_session_last_ref_saves_then_terminates(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _make_saving_sup()
+    sup.open_session(str(sample), session_id="solo", context_id="ctxA")
+
+    outcome = sup.release_session("solo", "ctxA")
+    assert outcome["terminated"] is True
+    assert outcome["saved"] is True
+    assert outcome["remaining_refs"] == 0
+    assert "solo" not in sup.sessions
+    assert sup.context_bindings == {}
+    # idalib_save fired before the worker was terminated.
+    assert sup.save_calls == [("idalib_save", "")]
+
+
+def test_release_session_from_unbound_context_is_noop(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _make_saving_sup()
+    sup.open_session(str(sample), session_id="shared", context_id="ctxA")
+
+    outcome = sup.release_session("shared", "ctxB")
+    assert outcome["released"] is False
+    assert outcome["terminated"] is False
+    # No save happened — only bound contexts trigger saves.
+    assert sup.save_calls == []
+    assert "shared" in sup.sessions
+
+
+def test_release_session_unknown_id_returns_error():
+    sup = _make_saving_sup()
+    outcome = sup.release_session("ghost", "ctxA")
+    assert outcome == {
+        "success": False,
+        "released": False,
+        "terminated": False,
+        "error": "Session not found: ghost",
+    }
+
+
+def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
+    """Race: A is the last holder and starts save; B opens during the save
+    and adds a ref. A's post-save recheck must SKIP the terminate.
+    """
+    import threading as _threading
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _make_saving_sup()
+    sup.open_session(str(sample), session_id="solo", context_id="ctxA")
+
+    save_started = _threading.Event()
+    save_can_finish = _threading.Event()
+
+    original_save = sup._save_session_idb
+
+    def slow_save(session):
+        save_started.set()
+        save_can_finish.wait(timeout=5.0)
+        return original_save(session)
+
+    sup._save_session_idb = slow_save
+
+    result_holder: dict = {}
+
+    def do_release():
+        result_holder["r"] = sup.release_session("solo", "ctxA")
+
+    t = _threading.Thread(target=do_release)
+    t.start()
+    assert save_started.wait(timeout=2.0)
+
+    # While ctxA's save is in flight, ctxB joins the (still alive) session.
+    sup.open_session(str(sample), session_id="solo", context_id="ctxB")
+
+    save_can_finish.set()
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    outcome = result_holder["r"]
+    assert outcome["released"] is True
+    assert outcome["terminated"] is False  # B's ref kept it alive
+    assert outcome["remaining_refs"] == 1
+    assert "solo" in sup.sessions
+    assert sup.context_bindings == {"ctxB": "solo"}
+
+
+# ---------------------------------------------------------------------------
+# Pending-open early-return + idalib_list_pending
+# ---------------------------------------------------------------------------
+
+
+class _SlowFakeSupervisor(_FakeSupervisor):
+    """FakeSupervisor whose call_worker_tool blocks for spawn_delay seconds."""
+
+    def __init__(self, spawn_delay=0.5):
+        super().__init__()
+        self.spawn_delay = spawn_delay
+        self.spawn_starts: list[float] = []
+        self._spawn_count = 0
+        self._spawn_lock = __import__("threading").Lock()
+
+    def call_worker_tool(self, worker, name, arguments=None):
+        if name == "idalib_open":
+            import time as _time
+            with self._spawn_lock:
+                self._spawn_count += 1
+                self.spawn_starts.append(_time.monotonic())
+            _time.sleep(self.spawn_delay)
+            return super().call_worker_tool(worker, name, arguments)
+        return super().call_worker_tool(worker, name, arguments)
+
+
+def test_open_session_returns_opening_when_wait_timeout_elapses(tmp_path):
+    import time
+    sample = tmp_path / "slow.bin"
+    sample.write_bytes(b"x")
+    sup = _SlowFakeSupervisor(spawn_delay=1.0)
+
+    t0 = time.monotonic()
+    result = sup.open_session(str(sample), context_id="ctxA", wait_timeout=0.1)
+    elapsed = time.monotonic() - t0
+    assert isinstance(result, dict), f"expected pending dict, got {type(result)}"
+    assert result["status"] == "opening"
+    assert result["filename"] == "slow.bin"
+    assert elapsed < 0.9, f"wait_timeout not honoured ({elapsed:.2f}s)"
+    # list_open_pending lists it for ctxA but not for ctxB
+    assert len(sup.list_pending("ctxA")) == 1
+    assert sup.list_pending("ctxB") == []
+
+    # Wait for the spawn to actually finish.
+    import time as _time
+    for _ in range(40):
+        if "ctxA" in sup.context_bindings:
+            break
+        _time.sleep(0.05)
+    assert "ctxA" in sup.context_bindings
+
+
+def test_open_session_concurrent_same_path_coalesces_into_one_spawn(tmp_path):
+    import threading as _threading
+    sample = tmp_path / "shared.bin"
+    sample.write_bytes(b"x")
+    sup = _SlowFakeSupervisor(spawn_delay=0.4)
+
+    results: list = []
+    results_lock = _threading.Lock()
+
+    def open_one(ctx):
+        r = sup.open_session(str(sample), context_id=ctx, wait_timeout=2.0)
+        with results_lock:
+            results.append((ctx, r))
+
+    threads = [
+        _threading.Thread(target=open_one, args=(f"ctx{i}",)) for i in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    # Exactly one underlying spawn.
+    assert sup._spawn_count == 1, f"expected 1 spawn, got {sup._spawn_count}"
+    # All four results are the same WorkerSession.
+    sessions = [r for _, r in results if not isinstance(r, dict)]
+    assert len(sessions) == 4
+    assert {s.session_id for s in sessions} == {sessions[0].session_id}
+    # Every context bound to that session.
+    assert all(
+        sup.context_bindings.get(f"ctx{i}") == sessions[0].session_id
+        for i in range(4)
+    )
+
+
+def test_list_pending_isolated_per_context(tmp_path):
+    sample = tmp_path / "a.bin"
+    sample.write_bytes(b"x")
+    sup = _SlowFakeSupervisor(spawn_delay=2.0)
+
+    # ctxA requests, ctxB doesn't
+    pending = sup.open_session(str(sample), context_id="ctxA", wait_timeout=0.05)
+    assert isinstance(pending, dict)
+
+    assert len(sup.list_pending("ctxA")) == 1
+    assert sup.list_pending("ctxB") == []
+    assert sup.list_pending("ctxC") == []
+
+    # ctxB joins the same pending → both contexts see it
+    sup.open_session(str(sample), context_id="ctxB", wait_timeout=0.05)
+    assert len(sup.list_pending("ctxA")) == 1
+    assert len(sup.list_pending("ctxB")) == 1
+    assert sup.list_pending("ctxC") == []
+
+
+def test_resolve_session_for_pending_session_id_gives_helpful_error(tmp_path):
+    sample = tmp_path / "slow.bin"
+    sample.write_bytes(b"x")
+    sup = _SlowFakeSupervisor(spawn_delay=2.0)
+
+    pending = sup.open_session(str(sample), context_id="ctxA", wait_timeout=0.05)
+    assert isinstance(pending, dict)
+    try:
+        sup.resolve_session(pending["session_id"])
+    except RuntimeError as e:
+        assert "still opening" in str(e)
+        assert pending["session_id"] in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_open_session_wait_timeout_none_blocks_until_ready(tmp_path):
+    import time
+    sample = tmp_path / "slow.bin"
+    sample.write_bytes(b"x")
+    sup = _SlowFakeSupervisor(spawn_delay=0.3)
+
+    t0 = time.monotonic()
+    result = sup.open_session(
+        str(sample), context_id="ctxA", wait_timeout=None
+    )
+    elapsed = time.monotonic() - t0
+    # We blocked through the entire spawn (wait_timeout=None means wait forever).
+    assert not isinstance(result, dict)
+    assert result.session_id is not None
+    assert elapsed >= 0.25

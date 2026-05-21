@@ -210,6 +210,12 @@ class PendingOpen:
     When the spawn finishes the contexts in ``contexts_waiting`` are
     bound atomically and ``ready_event`` is set so every blocked open
     call wakes up.
+
+    ``requested_session_id`` records the *original* caller-provided id
+    (None when auto-generated). It lets ``_finalise_pending`` decide
+    whether a path collision detected DURING the spawn should be
+    raised (explicit id mismatch) or silently coalesced into the
+    existing session (no explicit id).
     """
 
     resolved_path: str
@@ -218,7 +224,11 @@ class PendingOpen:
     ready_event: threading.Event
     contexts_waiting: list[str] = field(default_factory=list)
     run_auto_analysis: bool = True
-    error: Optional[str] = None
+    # ``error`` carries the exception that should be raised to waiters
+    # (preserving type — ValueError for API/collision misuse,
+    # RuntimeError for spawn failures, FileNotFoundError, ...).
+    error: Optional[Exception] = None
+    requested_session_id: Optional[str] = None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -671,7 +681,7 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         session_id: str | None = None,
         context_id: str | None = None,
-        wait_timeout: float = 10.0,
+        wait_timeout: float | None = 10.0,
     ) -> Union[WorkerSession, IdalibPendingInfo]:
         """Open *input_path* for *context_id*, returning a session or pending status.
 
@@ -685,7 +695,7 @@ class IdalibSupervisor:
         * Concurrent callers (any agent / any context) for the same
           path always share one worker.
 
-        Pass ``wait_timeout=float('inf')`` to block until ready (used by
+        Pass ``wait_timeout=None`` to block until ready (used by
         the startup --input_path path).
         """
         resolved = self._normalize_input_path(input_path)
@@ -737,6 +747,7 @@ class IdalibSupervisor:
                     ready_event=threading.Event(),
                     contexts_waiting=[context_id] if context_id else [],
                     run_auto_analysis=run_auto_analysis,
+                    requested_session_id=requested_session_id,
                 )
                 self._pending[path_key] = pending
                 start_spawn = True
@@ -754,6 +765,13 @@ class IdalibSupervisor:
         pending.ready_event.wait(timeout=wait_timeout)
 
         with self._lock:
+            # Error wins over a possibly-coalesced session in
+            # self.sessions[pending.session_id] — when the spawn ran
+            # into a session_id collision the existing session under
+            # that id belongs to a DIFFERENT path and we don't want to
+            # silently hand it back.
+            if pending.error is not None:
+                raise pending.error
             session = self.sessions.get(pending.session_id)
             if session is not None and session.is_alive():
                 # Late-arriving context_id: make sure it's bound before
@@ -762,8 +780,6 @@ class IdalibSupervisor:
                     self.bind_context(context_id, session.session_id)
                 session.last_accessed = datetime.now()
                 return session
-            if pending.error:
-                raise RuntimeError(pending.error)
             return pending.to_status_dict()
 
     def _spawn_session_in_background(self, pending: PendingOpen) -> None:
@@ -825,7 +841,7 @@ class IdalibSupervisor:
             with self._lock:
                 if self._pending.get(path_key) is pending:
                     self._pending.pop(path_key)
-                pending.error = str(e)
+                pending.error = e if isinstance(e, Exception) else RuntimeError(str(e))
             pending.ready_event.set()
 
     def _finalise_pending(
@@ -837,14 +853,64 @@ class IdalibSupervisor:
         was in flight are added atomically with the session
         registration, so waiters wake up to a consistent
         (sessions, context_bindings) snapshot.
+
+        Defensive collision handling: if another session sneaked into
+        ``self.sessions`` or ``self.path_to_session`` during our spawn
+        (e.g. via a stale entry or external injection in tests), we
+        do NOT overwrite it. The newly-spawned worker is discarded
+        and pending.error is set so waiters surface a clear message.
         """
         path_key = self._path_key(pending.resolved_path)
+        discard: tuple[WorkerSession, str] | None = None
         with self._lock:
             if self._pending.get(path_key) is pending:
                 self._pending.pop(path_key)
-            self._register_session_locked(session, pending.resolved_path, None)
-            for ctx in pending.contexts_waiting:
-                self.bind_context(ctx, session.session_id)
+
+            existing_by_path = self.path_to_session.get(path_key)
+            existing_by_path_session = (
+                self.sessions.get(existing_by_path) if existing_by_path else None
+            )
+            existing_by_id = self.sessions.get(pending.session_id)
+
+            path_collision = (
+                existing_by_path_session is not None
+                and existing_by_path_session.is_alive()
+                and existing_by_path != pending.session_id
+            )
+            id_collision = existing_by_id is not None and existing_by_id is not session
+
+            if path_collision:
+                # The path is owned by a different live session that
+                # appeared during our spawn (path_to_session under-the-
+                # hood update). If the caller didn't request a specific
+                # id we silently coalesce; otherwise we raise.
+                discard = (session, pending.session_id)
+                pending.session_id = existing_by_path_session.session_id
+                existing_by_path_session.last_accessed = datetime.now()
+                for ctx in pending.contexts_waiting:
+                    self.bind_context(ctx, existing_by_path_session.session_id)
+                if (
+                    pending.requested_session_id is not None
+                    and pending.requested_session_id != existing_by_path_session.session_id
+                ):
+                    pending.error = ValueError(
+                        f"Binary already open as session '{existing_by_path_session.session_id}', "
+                        f"cannot reuse different session_id '{pending.requested_session_id}'."
+                    )
+            elif id_collision:
+                # Our session_id was claimed by some OTHER path/session
+                # mid-spawn — always an error, even when the caller
+                # didn't ask for that id (we minted it but the universe
+                # disagrees).
+                discard = (session, pending.session_id)
+                pending.error = ValueError(f"Session already exists: {pending.session_id}")
+            else:
+                self._register_session_locked(session, pending.resolved_path, None)
+                for ctx in pending.contexts_waiting:
+                    self.bind_context(ctx, session.session_id)
+
+        if discard is not None:
+            self._discard_opened_worker_session(discard[0], discard[1])
         pending.ready_event.set()
 
     def list_pending(self, context_id: str) -> list[IdalibPendingInfo]:
@@ -1688,7 +1754,7 @@ def main() -> None:
             supervisor.open_session(
                 str(args.input_path),
                 context_id=startup_context_id,
-                wait_timeout=float("inf"),
+                wait_timeout=None,
             )
         except Exception as e:
             raise SystemExit(f"Failed to open initial binary: {e}")
