@@ -260,6 +260,19 @@ class WorkerSession:
     backend: str = "worker"
     owned: bool = True
     pid: int | None = None
+    # Per-session lock for serialising operations that "do real work"
+    # against this session (save, terminate, …). The supervisor's
+    # ``self._lock`` is reserved for short critical sections that
+    # mutate or iterate the cross-binary state dicts; this lock is
+    # held across the long stuff so that cross-binary operations can
+    # proceed in parallel.
+    #
+    # Locking discipline: it is OK to take ``supervisor._lock``
+    # briefly while holding ``session.lock``. It is NOT OK to take
+    # ``session.lock`` while holding ``supervisor._lock`` — that
+    # would create a circular wait against the close path, which
+    # follows the (session.lock → state.lock) order.
+    lock: threading.RLock = field(default_factory=threading.RLock, compare=False, repr=False)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -965,45 +978,42 @@ class IdalibSupervisor:
     ) -> dict[str, Any]:
         """Drop *context_id*'s binding to *session_id*, refcounted.
 
+        Locking architecture (4 phases):
+
+        * **Phase A** — ``self._lock`` (state lock, brief): find the
+          session, pop ``context_id`` from ``context_bindings``,
+          compute ``is_last``. Held just long enough to do the dict
+          mutation; no I/O.
+        * **Phase B** — ``session.lock`` (per-session, long-running):
+          save the IDB. Two concurrent ``release_session`` calls on
+          the same session serialise here; one finishes its save
+          before the next acquires.
+        * **Phase C** — ``self._lock`` (brief, NESTED inside
+          ``session.lock``): if we were the last ref, recheck
+          ``context_bindings`` to catch a concurrent ``open_session``
+          that added a binding during our save, and either unregister
+          the session or back out of termination. Lock order is
+          ``session.lock → self._lock``; the reverse is forbidden by
+          convention so we never deadlock.
+        * **Phase D** — ``session.lock`` only: actually terminate the
+          worker process. Any further save attempt on this session
+          (from another thread that's waiting on ``session.lock``)
+          will wake up to find the worker dead and report
+          ``saved=False``.
+
         Three outcomes:
 
         * Session unknown → ``{"success": False, "error": ...}``.
         * Session exists but *context_id* wasn't bound to it →
           ``{"success": True, "released": False, "terminated": False,
           "remaining_refs": <int>}``.
-        * This context was the last holder → save the IDB, terminate
-          the worker, return ``{"success": True, "released": True,
-          "terminated": True, "saved": <bool>, "remaining_refs": 0}``.
-        * Other contexts still hold the binary → just unbind ours, save
-          the IDB so this agent's edits persist, return
-          ``{"success": True, "released": True, "terminated": False,
-          "remaining_refs": <int>, "saved": <bool>}``.
-
-        Locking note: the bookkeeping pop, the save, and the
-        terminate-or-not decision all run under ``self._lock``. The
-        save itself is an HTTP round-trip to the worker, so the
-        critical section is "slow" (tens of ms typical) — but a
-        ``release_session`` call is rare relative to tool dispatches,
-        and holding the lock through the save is what eliminates two
-        classes of race that an earlier "save outside the lock"
-        version couldn't avoid:
-
-        1. A concurrent ``release_session`` for the same session
-           reaches step 1 while we're saving, decides ``is_last=False``
-           wrongly because it sees a different snapshot of
-           ``context_bindings`` than ours;
-        2. A concurrent ``open_session`` for the same path binds a
-           fresh context during our save, then we terminate the worker
-           it just attached to.
-
-        Both go away if save runs while the lock is held, because no
-        other thread can mutate ``context_bindings`` or
-        ``path_to_session`` mid-save. Worker-level concurrent saves
-        are still possible across DIFFERENT sessions (different
-        WorkerSessions, different lock holders if the supervisor ever
-        sharded its lock per-session) — but a single session's
-        save↔terminate pair is now atomic.
+        * This context was the last holder → save, terminate, return
+          ``{"terminated": True, "saved": <bool>}``.
+        * Other contexts still hold the binary → just unbind ours,
+          save the IDB so this agent's edits persist, return
+          ``{"terminated": False, "remaining_refs": <int>}``.
         """
+        # Phase A: state lock, brief — pop our binding, decide is_last.
         with self._lock:
             session = self.sessions.get(session_id)
             if session is None:
@@ -1021,14 +1031,17 @@ class IdalibSupervisor:
             remaining = len(bound)
             is_last = had_binding and remaining == 0
 
-            # Save under the lock so the save and the
-            # terminate-or-not decision are atomic w.r.t. concurrent
-            # close / open.
-            saved, save_error = (
-                self._save_session_idb(session) if had_binding else (False, None)
-            )
+        # Phase B: session lock, long-running save. Cross-binary
+        # operations on OTHER sessions can proceed in parallel.
+        # Two concurrent releases on the SAME session serialise here.
+        with session.lock:
+            saved, save_error = (False, None)
+            if had_binding:
+                saved, save_error = self._save_session_idb(session)
 
             if not is_last:
+                # Not the last holder — we're done. Worker stays alive
+                # for the remaining contexts.
                 return {
                     "success": True,
                     "released": had_binding,
@@ -1038,23 +1051,48 @@ class IdalibSupervisor:
                     "save_error": save_error,
                 }
 
-            popped = self._unregister_session_locked(session_id)
-        if popped is None:
-            popped = session  # shouldn't happen, but be defensive
-        if popped.backend == "worker":
-            try:
-                self.call_worker_tool(popped, "idalib_close", {"session_id": session_id})
-            except Exception:
-                logger.debug("Worker idalib_close failed for %s", session_id, exc_info=True)
-        self._terminate_worker(popped)
-        return {
-            "success": True,
-            "released": True,
-            "terminated": True,
-            "remaining_refs": 0,
-            "saved": saved,
-            "save_error": save_error,
-        }
+            # Phase C: nested state lock inside session lock — recheck
+            # for late bindings and either unregister or back out.
+            with self._lock:
+                late_refs = self._bound_context_ids_locked(session_id)
+                if late_refs:
+                    # A concurrent open bound a new context during our
+                    # save. Worker stays alive for them.
+                    return {
+                        "success": True,
+                        "released": True,
+                        "terminated": False,
+                        "remaining_refs": len(late_refs),
+                        "saved": saved,
+                        "save_error": save_error,
+                    }
+                popped = self._unregister_session_locked(session_id)
+            if popped is None:
+                popped = session  # shouldn't happen, but be defensive
+
+            # Phase D: terminate, still under session.lock so any
+            # concurrent same-session save waiting on session.lock
+            # sees a dead worker rather than a half-torn-down one.
+            if popped.backend == "worker":
+                try:
+                    self.call_worker_tool(
+                        popped, "idalib_close", {"session_id": session_id}
+                    )
+                except Exception:
+                    logger.debug(
+                        "Worker idalib_close failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+            self._terminate_worker(popped)
+            return {
+                "success": True,
+                "released": True,
+                "terminated": True,
+                "remaining_refs": 0,
+                "saved": saved,
+                "save_error": save_error,
+            }
 
     def _save_session_idb(self, session: WorkerSession) -> tuple[bool, str | None]:
         """Persist *session*'s IDB to disk via the worker. Returns (ok, err)."""

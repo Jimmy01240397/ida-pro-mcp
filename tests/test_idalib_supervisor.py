@@ -793,27 +793,23 @@ def test_concurrent_release_from_two_agents_terminates_exactly_once(tmp_path):
     assert sup.context_bindings == {}
 
 
-def test_release_session_concurrent_open_serializes_through_lock(tmp_path):
-    """Save under self._lock makes close atomic w.r.t. concurrent
-    open_session. An open that arrives during a final-ref close waits
-    on self._lock; by the time it runs, the session is gone and the
-    open spawns a brand-new worker.
-
-    The previous design released self._lock during save so the open
-    could sneak in and add a ref that the post-save recheck would
-    catch. That worked but the save sat outside the lock — meaning a
-    concurrent close-vs-save / save-vs-terminate race could happen at
-    the worker level. We trade that race for a slightly more wasteful
-    "concurrent open spawns a fresh worker" outcome; no data is lost
-    because the close DID save before tearing down.
+def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
+    """A is the final ref and is mid-save. B opens the same path while
+    A's save is in flight. Because save runs under session.lock (NOT
+    self._lock), B's open can take self._lock briefly, see the live
+    session, and add a binding. A's post-save recheck (Phase C, brief
+    self._lock under session.lock) sees B's binding and BACKS OUT of
+    the terminate — worker stays alive for B.
     """
     import threading as _threading
+    import time as _time
 
     sample = tmp_path / "sample.bin"
     sample.write_bytes(b"x")
     sup = _make_saving_sup()
     sup.open_session(str(sample), session_id="solo", context_id="ctxA")
-    pre_close_process = sup.sessions["solo"].process
+    worker_session = sup.sessions["solo"]
+    pre_close_process = worker_session.process
 
     save_started = _threading.Event()
     save_can_finish = _threading.Event()
@@ -827,56 +823,89 @@ def test_release_session_concurrent_open_serializes_through_lock(tmp_path):
 
     sup._save_session_idb = slow_save
 
-    result_holder: dict = {}
+    close_result: dict = {}
 
     def do_release():
-        result_holder["r"] = sup.release_session("solo", "ctxA")
+        close_result["r"] = sup.release_session("solo", "ctxA")
 
     t_close = _threading.Thread(target=do_release)
     t_close.start()
     assert save_started.wait(timeout=2.0)
 
-    # ctxB tries to open the same path while ctxA's close is mid-save.
-    # The open will block on self._lock until close completes.
-    open_done = _threading.Event()
-    open_result: list = []
+    # B opens during A's save. self._lock is NOT held by close's
+    # Phase B (save), so B's open runs freely.
+    open_session = sup.open_session(
+        str(sample), session_id="solo", context_id="ctxB"
+    )
+    assert open_session is worker_session, (
+        "open should reuse the same WorkerSession, not spawn a new one"
+    )
+    assert sup.context_bindings == {"ctxB": "solo"}, (
+        f"ctxB should be bound while ctxA's close is mid-save, got {sup.context_bindings}"
+    )
 
-    def do_open():
-        try:
-            open_result.append(
-                sup.open_session(str(sample), session_id="solo", context_id="ctxB")
-            )
-        finally:
-            open_done.set()
-
-    t_open = _threading.Thread(target=do_open)
-    t_open.start()
-    # Give the open a moment to reach the self._lock acquire.
-    import time as _time
-    _time.sleep(0.1)
-    assert not open_done.is_set(), "open should be blocked on self._lock during close"
-
-    # Let the close finish.
+    # Let A's close finish — Phase C recheck will see B's late binding.
     save_can_finish.set()
     t_close.join(timeout=3.0)
-    t_open.join(timeout=3.0)
     assert not t_close.is_alive()
-    assert not t_open.is_alive()
 
-    outcome = result_holder["r"]
-    # Close ran atomically: is_last=True, saved, terminated.
+    outcome = close_result["r"]
     assert outcome["released"] is True
-    assert outcome["terminated"] is True
-    assert outcome["saved"] is True
-    # B's open ran AFTER close, saw no session, spawned fresh.
-    assert open_result, "open did not complete"
-    new_session = open_result[0]
-    assert new_session.session_id == "solo"
-    assert new_session.process is not pre_close_process, (
-        "expected a fresh worker process, got the same one back"
+    assert outcome["terminated"] is False, (
+        f"close should have backed out of terminate; got {outcome}"
     )
-    assert sup.sessions["solo"] is new_session
+    assert outcome["remaining_refs"] == 1
+    assert outcome["saved"] is True
+    # Worker is the same process — not torn down.
+    assert "solo" in sup.sessions
+    assert sup.sessions["solo"].process is pre_close_process
     assert sup.context_bindings == {"ctxB": "solo"}
+
+
+def test_release_session_does_not_block_other_session_close(tmp_path):
+    """Cross-binary closes run in parallel — per-session lock means
+    one binary's close doesn't stall another binary's close.
+    """
+    import threading as _threading
+    import time as _time
+
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(b"x")
+    b.write_bytes(b"y")
+    sup = _make_saving_sup()
+    sup.open_session(str(a), session_id="A", context_id="ctxA")
+    sup.open_session(str(b), session_id="B", context_id="ctxB")
+
+    original_save = sup._save_session_idb
+
+    def slow_save(session):
+        _time.sleep(0.3)
+        return original_save(session)
+
+    sup._save_session_idb = slow_save
+
+    results: dict = {}
+
+    def close(sid, ctx):
+        results[sid] = sup.release_session(sid, ctx)
+
+    t0 = _time.monotonic()
+    ta = _threading.Thread(target=close, args=("A", "ctxA"))
+    tb = _threading.Thread(target=close, args=("B", "ctxB"))
+    ta.start()
+    tb.start()
+    ta.join(timeout=2.0)
+    tb.join(timeout=2.0)
+    elapsed = _time.monotonic() - t0
+
+    # If closes serialised on a global lock, elapsed ≈ 0.6s. With
+    # per-session locks, they overlap and elapsed ≈ 0.3s.
+    assert elapsed < 0.5, (
+        f"cross-binary closes serialised (elapsed={elapsed:.2f}s); per-session lock not in effect"
+    )
+    assert results["A"]["terminated"] is True
+    assert results["B"]["terminated"] is True
 
 
 # ---------------------------------------------------------------------------
