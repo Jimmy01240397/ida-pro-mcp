@@ -119,8 +119,13 @@ class IdalibOpenResult(IdalibContextFields, total=False):
     error: str
 
 
-class IdalibCloseResult(TypedDict, total=False):
+class IdalibCloseResult(IdalibContextFields, total=False):
     success: bool
+    released: bool
+    terminated: bool
+    remaining_refs: int
+    saved: bool
+    save_error: Optional[str]
     message: str
     error: str
 
@@ -720,6 +725,12 @@ class IdalibSupervisor:
         return existing_session
 
     def close_session(self, session_id: str) -> bool:
+        """Force-close: drop ALL bindings + terminate worker.
+
+        Used by shutdown and other administrative paths. Per-context
+        close (the management tool) goes through release_session() so
+        other agents holding the binary don't lose their session.
+        """
         with self._lock:
             session = self._unregister_session_locked(session_id)
             if session is None:
@@ -731,6 +742,113 @@ class IdalibSupervisor:
                 logger.debug("Worker idalib_close failed for %s", session_id, exc_info=True)
         self._terminate_worker(session)
         return True
+
+    def _bound_context_ids_locked(self, session_id: str) -> list[str]:
+        return [
+            ctx for ctx, bound_sid in self.context_bindings.items() if bound_sid == session_id
+        ]
+
+    def release_session(
+        self, session_id: str, context_id: str
+    ) -> dict[str, Any]:
+        """Drop *context_id*'s binding to *session_id*, refcounted.
+
+        Three outcomes:
+
+        * Session unknown → ``{"success": False, "error": ...}``.
+        * Session exists but *context_id* wasn't bound to it →
+          ``{"success": True, "released": False, "terminated": False,
+          "remaining_refs": <int>}``.
+        * This context was the last holder → save the IDB, terminate
+          the worker, return ``{"success": True, "released": True,
+          "terminated": True, "saved": <bool>, "remaining_refs": 0}``.
+        * Other contexts still hold the binary → just unbind ours, save
+          the IDB so this agent's edits persist, return
+          ``{"success": True, "released": True, "terminated": False,
+          "remaining_refs": <int>, "saved": <bool>}``.
+        """
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return {
+                    "success": False,
+                    "released": False,
+                    "terminated": False,
+                    "error": f"Session not found: {session_id}",
+                }
+            bound = self._bound_context_ids_locked(session_id)
+            had_binding = context_id in bound
+            if had_binding:
+                self.context_bindings.pop(context_id, None)
+                bound = [ctx for ctx in bound if ctx != context_id]
+            remaining = len(bound)
+            is_last = had_binding and remaining == 0
+
+        # Save before deciding whether to terminate so this agent's
+        # edits hit disk regardless of whether other agents keep the
+        # worker alive.
+        saved, save_error = self._save_session_idb(session) if had_binding else (False, None)
+
+        if not is_last:
+            return {
+                "success": True,
+                "released": had_binding,
+                "terminated": False,
+                "remaining_refs": remaining,
+                "saved": saved,
+                "save_error": save_error,
+            }
+
+        # Final ref — try to fully unregister + terminate. But if a
+        # concurrent open_session() re-bound to this session during our
+        # save (it would see the path_to_session entry still pointing
+        # here), leave the worker alive so that new binding survives.
+        with self._lock:
+            late_refs = self._bound_context_ids_locked(session_id)
+            if late_refs:
+                return {
+                    "success": True,
+                    "released": True,
+                    "terminated": False,
+                    "remaining_refs": len(late_refs),
+                    "saved": saved,
+                    "save_error": save_error,
+                }
+            popped = self._unregister_session_locked(session_id)
+        if popped is None:
+            popped = session  # shouldn't happen, but be defensive
+        if popped.backend == "worker":
+            try:
+                self.call_worker_tool(popped, "idalib_close", {"session_id": session_id})
+            except Exception:
+                logger.debug("Worker idalib_close failed for %s", session_id, exc_info=True)
+        self._terminate_worker(popped)
+        return {
+            "success": True,
+            "released": True,
+            "terminated": True,
+            "remaining_refs": 0,
+            "saved": saved,
+            "save_error": save_error,
+        }
+
+    def _save_session_idb(self, session: WorkerSession) -> tuple[bool, str | None]:
+        """Persist *session*'s IDB to disk via the worker. Returns (ok, err)."""
+        if not session.is_alive():
+            return False, "Worker is not alive"
+        tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
+        try:
+            result = self.call_worker_tool(session, tool_name, {"path": ""})
+        except Exception as e:  # noqa: BLE001 — surface as save error
+            logger.warning(
+                "save before close failed for session %s: %s", session.session_id, e
+            )
+            return False, str(e)
+        if isinstance(result, dict):
+            if result.get("ok") is False:
+                return False, str(result.get("error") or "save returned ok=false")
+            return True, None
+        return True, None
 
     def _resolve_gui_fallback_path(self, session: WorkerSession) -> str:
         candidates = [session.input_path]
@@ -989,14 +1107,41 @@ def idalib_open(
 
 @mcp.tool
 def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibCloseResult:
-    """Close a database worker and remove all context bindings targeting it."""
+    """Drop the calling context's binding to a database, refcounted.
+
+    Saves the IDB first. If other contexts (other agents or other MCP
+    transport sessions) still hold the binary open, the worker stays
+    alive and only this context's binding is released. The worker is
+    terminated only when this context was the last holder.
+    """
     sup = _require_supervisor()
     try:
-        if sup.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
-        return {"success": False, "error": f"Session not found: {session_id}"}
+        context_id = sup.resolve_context_id()
+        outcome = sup.release_session(session_id, context_id)
+        message = _format_release_message(session_id, outcome)
+        return {
+            **outcome,
+            **sup.context_fields(context_id),
+            "message": message,
+        }
     except Exception as e:
         return {"error": f"Failed to close session: {e}"}
+
+
+def _format_release_message(session_id: str, outcome: dict[str, Any]) -> str:
+    if not outcome.get("success"):
+        return outcome.get("error", "Close failed")
+    if outcome.get("terminated"):
+        return f"Session closed and worker terminated: {session_id}"
+    if outcome.get("released"):
+        return (
+            f"Session unbound from this context; {outcome.get('remaining_refs', 0)} "
+            f"other binding(s) still attached, worker stays alive: {session_id}"
+        )
+    return (
+        f"This context was not bound to {session_id}; nothing to release. "
+        f"{outcome.get('remaining_refs', 0)} other binding(s) still attached."
+    )
 
 
 @mcp.tool
