@@ -369,7 +369,7 @@ class IdalibSupervisor:
         *,
         isolated_contexts: bool = False,
         bearer_contexts: bool = False,
-        max_workers: int = 4,
+        max_workers: int = 0,
         worker_args: list[str] | None = None,
     ):
         self.mcp = mcp
@@ -1898,8 +1898,8 @@ def main() -> None:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
-        help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
+        default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "0")),
+        help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 0).",
     )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()
