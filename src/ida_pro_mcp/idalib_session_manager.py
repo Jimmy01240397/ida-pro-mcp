@@ -4,17 +4,28 @@ Each binary runs in its own idalib worker subprocess.  Communication uses
 line-delimited JSON-RPC over stdin/stdout pipes (no network ports).  A
 per-worker lock serialises requests so multiple agents can safely share
 the same session manager.
+
+Opens are split into two phases:
+
+* The caller of :meth:`open_binary` blocks for at most ``wait_timeout``
+  seconds.  If the worker becomes ready in that window, ``open_binary``
+  returns ``{"status": "ready", "session": ...}``.
+* Otherwise it returns ``{"status": "opening", ...}``; a background
+  thread keeps reading the worker's stdout until either ``WORKER_READY``
+  arrives (at which point the session is published) or ``spawn_timeout``
+  elapses (at which point the worker is killed and the slot freed).
+
+Concurrent ``open_binary`` calls for the same path coalesce onto a
+single worker, so duplicate spawns are impossible even when the HTTP
+server dispatches requests on multiple threads.
 """
 
 import atexit
 import json
 import logging
-import os
-import select
 import subprocess
 import sys
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,6 +37,9 @@ logger = logging.getLogger(__name__)
 _WORKER_SCRIPT = str(Path(__file__).parent / "idalib_worker.py")
 _READY_SENTINEL = "WORKER_READY"
 _ERROR_SENTINEL = "WORKER_ERROR"
+
+_DEFAULT_WAIT_TIMEOUT = 10.0  # seconds before open_binary returns "opening"
+_DEFAULT_SPAWN_TIMEOUT = 3600.0  # hard limit on background spawn (1 hour)
 
 
 @dataclass
@@ -57,20 +71,42 @@ class IDAWorkerSession:
         }
 
 
-class IDASessionManager:
-    """Manages idalib worker subprocesses communicating via stdio.
+@dataclass
+class PendingOpen:
+    """A worker subprocess that has been spawned but is not yet ready."""
 
-    * ``open_binary()`` spawns a worker, waits for it to be ready, and
-      returns its ``session_id``.
-    * ``proxy_jsonrpc(session_id, method, params)`` sends a JSON-RPC
-      request to the worker via stdin and reads the response from stdout.
-    * ``close_session(session_id)`` terminates the worker.
-    """
+    resolved_path: str
+    session_id: str
+    process: subprocess.Popen
+    started_at: datetime
+    ready_event: threading.Event
+    error: Optional[str] = None  # set when spawn fails; ready_event is also set
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (datetime.now() - self.started_at).total_seconds()
+
+    def to_status_dict(self) -> dict:
+        return {
+            "status": "opening",
+            "session_id": self.session_id,
+            "resolved_path": self.resolved_path,
+            "filename": Path(self.resolved_path).name,
+            "started_at": self.started_at.isoformat(),
+            "elapsed_seconds": self.elapsed_seconds,
+            "pid": self.process.pid,
+        }
+
+
+class IDASessionManager:
+    """Manages idalib worker subprocesses communicating via stdio."""
 
     def __init__(self):
         self._sessions: Dict[str, IDAWorkerSession] = {}
+        # resolved-path → in-flight spawn.  Holding ``_lock`` makes the
+        # check-and-insert atomic, which is what prevents duplicate spawns.
+        self._pending: Dict[str, PendingOpen] = {}
         self._lock = threading.RLock()
-        self._pending_paths: set[str] = set()  # paths being opened (prevents duplicates)
         logger.info("IDASessionManager initialised")
 
     # ------------------------------------------------------------------
@@ -80,9 +116,26 @@ class IDASessionManager:
     def open_binary(
         self,
         input_path: Path | str,
-        timeout: float = 120.0,
-    ) -> str:
-        """Spawn a worker for *input_path* and return the session ID."""
+        wait_timeout: float = _DEFAULT_WAIT_TIMEOUT,
+        spawn_timeout: float = _DEFAULT_SPAWN_TIMEOUT,
+    ) -> dict:
+        """Open a worker for *input_path* and return its status.
+
+        Returns one of:
+
+        * ``{"status": "ready", "session": <session dict>}`` — worker is
+          live and the session ID is valid for tool calls.
+        * ``{"status": "opening", "session_id": ..., "elapsed_seconds": ..., ...}``
+          — the worker is still being spawned.  The same dict shape can
+          be obtained from subsequent ``open_binary`` calls for the same
+          path; the returned ``session_id`` is *not yet* usable for
+          ``proxy_jsonrpc`` until ``status`` becomes ``"ready"``.
+
+        Raises ``FileNotFoundError`` if the path doesn't exist, and
+        ``RuntimeError`` if the worker spawn failed.  Failed pendings are
+        removed from the in-flight set immediately, so a fresh
+        ``open_binary`` call will start a new spawn.
+        """
         input_path = Path(input_path)
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -90,53 +143,44 @@ class IDASessionManager:
         resolved = str(input_path.resolve())
 
         with self._lock:
-            # Re-use existing session for the same binary
-            for sid, session in self._sessions.items():
+            # Re-use a live session for the same binary.
+            for sid, session in list(self._sessions.items()):
                 if str(session.input_path.resolve()) == resolved:
                     if session.alive:
-                        logger.info("Binary already open in session %s", sid)
                         session.last_accessed = datetime.now()
-                        return sid
-                    else:
-                        logger.warning("Stale session %s, re-spawning", sid)
-                        self._sessions.pop(sid)
-                        break
+                        return {"status": "ready", "session": session.to_dict()}
+                    # Stale session — drop it and fall through to spawn.
+                    logger.warning("Stale session %s, re-spawning", sid)
+                    self._sessions.pop(sid)
+                    break
 
-            # Prevent duplicate spawns: if another thread is already
-            # opening this path, wait and return its session.
-            if resolved in self._pending_paths:
-                raise RuntimeError(
-                    f"Binary is already being opened: {input_path}"
-                )
-            self._pending_paths.add(resolved)
-            session_id = str(uuid.uuid4())[:8]
+            pending = self._pending.get(resolved)
+            if pending is None:
+                pending = self._begin_spawn(input_path, resolved, spawn_timeout)
 
-        # Spawn outside self._lock so other sessions aren't blocked.
-        try:
-            worker = self._spawn_worker(input_path, timeout)
-        except Exception:
-            with self._lock:
-                self._pending_paths.discard(resolved)
-            raise
+        # Wait OUTSIDE the manager lock so other paths (and concurrent
+        # callers for the same path) aren't blocked.  The pending object
+        # lives until _finalise_pending() decides its fate.
+        pending.ready_event.wait(timeout=wait_timeout)
 
         with self._lock:
-            self._pending_paths.discard(resolved)
-            session = IDAWorkerSession(
-                session_id=session_id,
-                input_path=input_path,
-                process=worker,
-            )
-            self._sessions[session_id] = session
-
-        logger.info(
-            "Session %s ready: %s (pid %d)",
-            session_id,
-            input_path.name,
-            worker.pid,
-        )
-        return session_id
+            session = self._sessions.get(pending.session_id)
+            if session is not None:
+                session.last_accessed = datetime.now()
+                return {"status": "ready", "session": session.to_dict()}
+            if pending.error:
+                # All waiters on this pending see the same error.  The
+                # entry has already been removed from _pending by
+                # _finalise_pending, so a fresh open call will retry.
+                raise RuntimeError(pending.error)
+            return pending.to_status_dict()
 
     def close_session(self, session_id: str) -> bool:
+        """Terminate a live session.  Returns ``False`` for unknown IDs.
+
+        Pending sessions (still spawning) are intentionally not affected
+        here — wait for them to finish or fail naturally.
+        """
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -154,6 +198,18 @@ class IDASessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
+                # Friendlier error if the caller is using a session_id
+                # that's still being spawned.
+                pending = next(
+                    (p for p in self._pending.values() if p.session_id == session_id),
+                    None,
+                )
+                if pending is not None:
+                    raise RuntimeError(
+                        f"Session {session_id} is still opening "
+                        f"(elapsed={pending.elapsed_seconds:.1f}s). "
+                        f"Call idalib_open again to wait for it to be ready."
+                    )
                 raise ValueError(f"Session not found: {session_id}")
             if not session.alive:
                 raise RuntimeError(
@@ -192,68 +248,210 @@ class IDASessionManager:
             return self._sessions.get(session_id)
 
     def list_sessions(self) -> list[dict]:
+        """Return only sessions whose worker is ready for tool calls.
+
+        Pending opens are deliberately excluded — they appear here only
+        after ``WORKER_READY`` is received.
+        """
         with self._lock:
             return [s.to_dict() for s in self._sessions.values()]
+
+    def list_pending(self) -> list[dict]:
+        """Return status entries for in-flight opens (mainly for debugging)."""
+        with self._lock:
+            return [p.to_status_dict() for p in self._pending.values()]
 
     def close_all_sessions(self) -> None:
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            pendings = list(self._pending.values())
+            # Don't clear _pending here — _finalise_pending() will remove
+            # entries as monitor threads exit, and we want the kill to
+            # propagate via EOF detection.
         for session in sessions:
             with session._lock:
                 self._terminate_worker(session)
+        for pending in pendings:
+            self._kill_process(pending.process)
         logger.info("All sessions closed")
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _spawn_worker(self, input_path: Path, timeout: float) -> subprocess.Popen:
+    def _begin_spawn(
+        self, input_path: Path, resolved: str, spawn_timeout: float
+    ) -> PendingOpen:
+        """Spawn a worker process and register the pending entry.
+
+        Called with ``self._lock`` held.
+        """
+        session_id = str(uuid.uuid4())[:8]
+        process = self._start_worker_process(input_path)
+        pending = PendingOpen(
+            resolved_path=resolved,
+            session_id=session_id,
+            process=process,
+            started_at=datetime.now(),
+            ready_event=threading.Event(),
+        )
+        self._pending[resolved] = pending
+
+        monitor = threading.Thread(
+            target=self._monitor_spawn,
+            args=(pending, spawn_timeout),
+            daemon=True,
+            name=f"idalib-spawn-{session_id}",
+        )
+        monitor.start()
+        return pending
+
+    def _start_worker_process(self, input_path: Path) -> subprocess.Popen:
+        """Spawn the worker subprocess.  Overridable for tests."""
         cmd = [sys.executable, _WORKER_SCRIPT, str(input_path)]
         logger.info("Spawning worker: %s", " ".join(cmd))
-
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,  # inherit parent stderr → journal / terminal
         )
 
-        # Wait for the WORKER_READY sentinel on stdout.
-        # Use select() so readline() never blocks past the deadline.
-        deadline = time.monotonic() + timeout
-        stdout_fd = proc.stdout.fileno()
-        buf = b""
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(
-                    f"Worker exited with code {proc.returncode} for {input_path}"
-                )
+    def _monitor_spawn(self, pending: PendingOpen, timeout: float) -> None:
+        """Background thread: wait for WORKER_READY (cross-platform).
 
-            remaining = max(0.1, deadline - time.monotonic())
-            ready, _, _ = select.select([stdout_fd], [], [], min(remaining, 1.0))
-            if not ready:
-                continue
+        A nested reader thread does the blocking ``readline()`` (so it
+        works on Windows, where ``select`` doesn't accept pipe FDs), and
+        an Event lets us bound the wait by ``timeout``.
+        """
+        proc = pending.process
+        result: list[tuple[bool, Optional[str]]] = []
+        done = threading.Event()
 
-            chunk = os.read(stdout_fd, 4096)
-            if not chunk:
-                raise RuntimeError(
-                    f"Worker stdout closed unexpectedly for {input_path}"
-                )
-            buf += chunk
-            while b"\n" in buf:
-                line_bytes, buf = buf.split(b"\n", 1)
-                line = line_bytes.decode().strip()
-                if line == _READY_SENTINEL:
-                    return proc
-                if line.startswith(_ERROR_SENTINEL):
-                    proc.kill()
-                    raise RuntimeError(line.split(":", 1)[1])
+        def reader() -> None:
+            try:
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        result.append(
+                            (False, f"Worker stdout closed (returncode={proc.poll()})")
+                        )
+                        done.set()
+                        return
+                    text = line.decode(errors="replace").strip()
+                    if text == _READY_SENTINEL:
+                        result.append((True, None))
+                        done.set()
+                        return
+                    if text.startswith(_ERROR_SENTINEL):
+                        err = (
+                            text.split(":", 1)[1]
+                            if ":" in text
+                            else "Worker reported error"
+                        )
+                        result.append((False, err))
+                        done.set()
+                        return
+                    # Other lines (debug logs etc.) are ignored.
+            except Exception as e:  # noqa: BLE001 — propagate as spawn error
+                result.append((False, f"Reader thread crashed: {e}"))
+                done.set()
 
-        proc.kill()
-        raise RuntimeError(
-            f"Worker did not become ready within {timeout}s for {input_path}"
+        threading.Thread(
+            target=reader,
+            daemon=True,
+            name=f"idalib-reader-{pending.session_id}",
+        ).start()
+
+        if done.wait(timeout=timeout):
+            ok, err = result[0]
+            if ok:
+                self._finalise_pending(pending, ok=True)
+            else:
+                self._kill_process(proc)
+                self._finalise_pending(pending, error=err)
+            return
+
+        # Hard spawn timeout — kill the worker so the reader thread
+        # unblocks via EOF, then surface the failure to any waiter.
+        self._kill_process(proc)
+        self._finalise_pending(
+            pending, error=f"Worker did not become ready within {timeout}s"
         )
+
+    def _finalise_pending(
+        self,
+        pending: PendingOpen,
+        *,
+        ok: bool = False,
+        error: Optional[str] = None,
+    ) -> None:
+        """Move a pending entry to either _sessions or the error slot.
+
+        If the pending entry has been displaced (e.g. by
+        ``close_all_sessions`` clearing state) we do NOT promote it to
+        a session — instead the worker is killed and the failure is
+        surfaced to waiters.  This keeps ``_sessions`` consistent with
+        ``_pending``: every live session went through a real spawn that
+        nobody else cancelled.
+
+        The ``ready_event`` is set last so any waiter observes a
+        consistent view of either ``_sessions`` or ``pending.error``.
+        """
+        promoted = False
+        with self._lock:
+            existing = self._pending.get(pending.resolved_path)
+            owned = existing is pending
+            if owned:
+                self._pending.pop(pending.resolved_path)
+
+            if owned and ok:
+                session = IDAWorkerSession(
+                    session_id=pending.session_id,
+                    input_path=Path(pending.resolved_path),
+                    process=pending.process,
+                )
+                self._sessions[pending.session_id] = session
+                promoted = True
+                logger.info(
+                    "Session %s ready: %s (pid %d)",
+                    pending.session_id,
+                    session.input_path.name,
+                    pending.process.pid,
+                )
+            elif not owned:
+                # Another path displaced this pending — most likely a
+                # reset.  Discard the worker so we don't leak a dead-end
+                # subprocess, and surface a clear error to waiters.
+                pending.error = "Spawn cancelled (pending entry was displaced)"
+                logger.warning(
+                    "Pending for %s was displaced; discarding worker",
+                    pending.resolved_path,
+                )
+            else:
+                pending.error = error or "unknown error"
+                logger.warning(
+                    "Spawn failed for %s: %s",
+                    pending.resolved_path,
+                    pending.error,
+                )
+
+        if not promoted:
+            self._kill_process(pending.process)
+
+        # Signal waiters AFTER releasing the lock so they observe
+        # _sessions / pending.error in the correct state.
+        pending.ready_event.set()
+
+    @staticmethod
+    def _kill_process(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.kill()
+        except Exception as e:  # noqa: BLE001 — best-effort cleanup
+            logger.warning("Failed to kill worker pid %d: %s", proc.pid, e)
 
     @staticmethod
     def _terminate_worker(session: IDAWorkerSession) -> None:

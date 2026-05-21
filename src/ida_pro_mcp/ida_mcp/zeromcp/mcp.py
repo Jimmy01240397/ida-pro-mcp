@@ -476,9 +476,13 @@ class McpServer:
             print("[MCP] Server is already running")
             return
 
-        # Create server with deferred binding
+        # Create server with deferred binding.
+        # Always use ThreadingHTTPServer so a slow handler (e.g. idalib_open
+        # spawning a worker) can't stall every other request. The `background`
+        # flag controls whether serve_forever() runs on a dedicated thread or
+        # the calling thread — independent of request-handling concurrency.
         assert issubclass(request_handler, McpHttpRequestHandler)
-        self._http_server = (ThreadingHTTPServer if background else HTTPServer)(
+        self._http_server = ThreadingHTTPServer(
             (host, port),
             request_handler,
             bind_and_activate=False

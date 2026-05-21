@@ -27,7 +27,10 @@ import idapro
 from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
 from ida_pro_mcp.ida_mcp.rpc import tool
-from ida_pro_mcp.idalib_session_manager import get_session_manager
+from ida_pro_mcp.idalib_session_manager import (
+    _DEFAULT_SPAWN_TIMEOUT,
+    get_session_manager,
+)
 
 
 # -----------------------------------------------------------------------
@@ -45,9 +48,20 @@ class IdalibSessionInfo(TypedDict):
     metadata: dict[str, Any]
 
 
+class IdalibPendingInfo(TypedDict):
+    session_id: str
+    resolved_path: str
+    filename: str
+    started_at: str
+    elapsed_seconds: float
+    pid: int
+
+
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
+    status: str  # "ready" | "opening"
     session: IdalibSessionInfo
+    pending: IdalibPendingInfo
     message: str
     error: str
 
@@ -64,10 +78,21 @@ class IdalibListResult(TypedDict, total=False):
     error: str
 
 
+class IdalibPendingListResult(TypedDict, total=False):
+    pending: list[IdalibPendingInfo]
+    count: int
+    error: str
+
+
 logger = logging.getLogger(__name__)
 
 # Tools handled by the main process — not proxied to workers.
-IDALIB_MANAGEMENT_TOOLS = {"idalib_open", "idalib_close", "idalib_list"}
+IDALIB_MANAGEMENT_TOOLS = {
+    "idalib_open",
+    "idalib_close",
+    "idalib_list",
+    "list_open_pending",
+}
 
 # Tools that don't touch any IDA database — handled locally, no session_id needed.
 _SESSION_FREE_TOOLS = IDALIB_MANAGEMENT_TOOLS | {
@@ -241,16 +266,49 @@ def _install_session_hooks() -> None:
 @tool
 def idalib_open(
     input_path: Annotated[str, "Path to the binary file to analyse"],
+    wait_timeout: Annotated[
+        float, "Seconds to wait for the worker to become ready before returning a pending status"
+    ] = 10.0,
 ) -> IdalibOpenResult:
-    """Open a binary in a new worker process. Returns the session_id for subsequent calls."""
+    """Open a binary in a new worker process.
+
+    Returns ``{status: 'ready', session: ...}`` once the worker is live,
+    or ``{status: 'opening', pending: ...}`` if it didn't become ready
+    within ``wait_timeout`` (the worker keeps loading in the background;
+    call this tool again to wait for it).
+    """
     try:
         manager = get_session_manager()
-        opened_id = manager.open_binary(Path(input_path))
-        session = manager.get_session(opened_id)
+        result = manager.open_binary(Path(input_path), wait_timeout=wait_timeout)
+        if result["status"] == "ready":
+            session = result["session"]
+            return {
+                "success": True,
+                "status": "ready",
+                "session": session,
+                "message": (
+                    f"Binary opened: {session['filename']} "
+                    f"(session_id={session['session_id']})"
+                ),
+            }
+        # status == "opening"
         return {
-            "success": True,
-            "session": session.to_dict(),
-            "message": f"Binary opened: {session.input_path.name} (session_id={opened_id})",
+            "success": False,
+            "status": "opening",
+            "pending": {
+                "session_id": result["session_id"],
+                "resolved_path": result["resolved_path"],
+                "filename": result["filename"],
+                "started_at": result["started_at"],
+                "elapsed_seconds": result["elapsed_seconds"],
+                "pid": result["pid"],
+            },
+            "message": (
+                f"Binary is still opening: {result['filename']} "
+                f"(session_id={result['session_id']}, "
+                f"elapsed={result['elapsed_seconds']:.1f}s). "
+                f"Call idalib_open again to wait for it to become ready."
+            ),
         }
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         return {"error": str(e)}
@@ -281,6 +339,33 @@ def idalib_list() -> IdalibListResult:
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
+
+
+@tool
+def list_open_pending() -> IdalibPendingListResult:
+    """List binaries whose worker is still spawning (not yet in idalib_list).
+
+    Each entry carries the same shape as ``idalib_open`` returns under
+    its ``pending`` key — including ``elapsed_seconds`` so callers can
+    decide whether to keep waiting.
+    """
+    try:
+        manager = get_session_manager()
+        raw = manager.list_pending()
+        pending: list[IdalibPendingInfo] = [
+            {
+                "session_id": entry["session_id"],
+                "resolved_path": entry["resolved_path"],
+                "filename": entry["filename"],
+                "started_at": entry["started_at"],
+                "elapsed_seconds": entry["elapsed_seconds"],
+                "pid": entry["pid"],
+            }
+            for entry in raw
+        ]
+        return {"pending": pending, "count": len(pending)}
+    except Exception as e:
+        return {"error": f"Failed to list pending opens: {e}"}
 
 
 # -----------------------------------------------------------------------
@@ -332,8 +417,19 @@ def main() -> None:
         if not args.input_path.exists():
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
         logger.info("Opening initial binary: %s", args.input_path)
-        sid = session_manager.open_binary(args.input_path)
-        logger.info("Initial session ready: %s", sid)
+        # Wait the full spawn timeout on startup so the server is ready
+        # to serve right away.
+        result = session_manager.open_binary(
+            args.input_path, wait_timeout=_DEFAULT_SPAWN_TIMEOUT
+        )
+        if result["status"] == "ready":
+            logger.info("Initial session ready: %s", result["session"]["session_id"])
+        else:
+            logger.warning(
+                "Initial binary still opening after %.1fs (session_id=%s)",
+                result["elapsed_seconds"],
+                result["session_id"],
+            )
     else:
         logger.info(
             "No initial binary. Use idalib_open() to load binaries dynamically."
