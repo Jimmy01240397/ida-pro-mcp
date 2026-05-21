@@ -88,6 +88,8 @@ class IdalibContextFields(TypedDict):
     context_id: NotRequired[str]
     transport_context_id: NotRequired[str | None]
     isolated_contexts: NotRequired[bool]
+    bearer_contexts: NotRequired[bool]
+    agent_id: NotRequired[str | None]
 
 
 class IdalibSessionInfo(TypedDict):
@@ -228,11 +230,13 @@ class IdalibSupervisor:
         mcp: Any,
         *,
         isolated_contexts: bool = False,
+        bearer_contexts: bool = False,
         max_workers: int = 4,
         worker_args: list[str] | None = None,
     ):
         self.mcp = mcp
         self.isolated_contexts = isolated_contexts
+        self.bearer_contexts = bearer_contexts
         self.max_workers = max_workers
         self.worker_args = worker_args or []
         self.sessions: dict[str, WorkerSession] = {}
@@ -247,13 +251,48 @@ class IdalibSupervisor:
     # Context helpers
     # ------------------------------------------------------------------
 
+    def _current_agent_id(self) -> str | None:
+        """Return the hashed Bearer-token agent id, or None when absent."""
+        getter = getattr(self.mcp, "get_current_agent_id", None)
+        if getter is None:
+            return None
+        try:
+            agent_id = getter()
+        except Exception:
+            return None
+        if not agent_id or agent_id == "anonymous":
+            return None
+        return agent_id
+
     def resolve_context_id(self) -> str:
+        # Bearer mode wins over MCP-transport-session mode so a client
+        # that authenticates always gets its own isolated context,
+        # regardless of whether the operator also enabled
+        # --isolated-contexts.
+        if self.bearer_contexts:
+            agent_id = self._current_agent_id()
+            if agent_id is None:
+                raise RuntimeError(
+                    "No Authorization: Bearer header on this request. "
+                    "Send 'Authorization: Bearer <your-token>' to identify "
+                    "the agent (the token is hashed; any string works)."
+                )
+            return f"bearer:{agent_id}"
+
+        # When Bearer mode isn't required server-side, still respect a
+        # Bearer header if the client chose to send one — this gives
+        # opt-in isolation without forcing all clients to authenticate.
+        agent_id = self._current_agent_id()
+        if agent_id is not None:
+            return f"bearer:{agent_id}"
+
         transport_context_id = self.mcp.get_current_transport_session_id()
         if self.isolated_contexts:
             if transport_context_id is None:
                 raise RuntimeError(
                     "No MCP transport context is active for this request. "
-                    "Use MCP initialize and send Mcp-Session-Id on /mcp requests."
+                    "Use MCP initialize and send Mcp-Session-Id on /mcp requests, "
+                    "or send 'Authorization: Bearer <token>' instead."
                 )
             return transport_context_id
         return SHARED_FALLBACK_CONTEXT_ID
@@ -263,6 +302,8 @@ class IdalibSupervisor:
             "context_id": context_id,
             "transport_context_id": self.mcp.get_current_transport_session_id(),
             "isolated_contexts": self.isolated_contexts,
+            "bearer_contexts": self.bearer_contexts,
+            "agent_id": self._current_agent_id(),
         }
 
     def bind_context(self, context_id: str, session_id: str) -> None:
@@ -1254,6 +1295,16 @@ def main() -> None:
         action="store_true",
         help="Enable strict per-transport database binding isolation.",
     )
+    parser.add_argument(
+        "--bearer-contexts",
+        action="store_true",
+        help=(
+            "Require an 'Authorization: Bearer <token>' header on every "
+            "request and use the hashed token as the context id. Lets "
+            "any HTTP client (not just MCP-spec clients) get an isolated "
+            "view of their idalib sessions."
+        ),
+    )
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe worker tools (DANGEROUS)")
     parser.add_argument(
         "--profile",
@@ -1285,10 +1336,14 @@ def main() -> None:
     supervisor = IdalibSupervisor(
         mcp,
         isolated_contexts=args.isolated_contexts,
+        bearer_contexts=args.bearer_contexts,
         max_workers=args.max_workers,
         worker_args=worker_args,
     )
     mcp.registry.dispatch = dispatch_supervisor
+    # --bearer-contexts isolates on a per-request basis (no transport
+    # session needed) so we only force the MCP streamable-HTTP session
+    # protocol when --isolated-contexts is set.
     mcp.require_streamable_http_session = args.isolated_contexts
 
     if args.input_path is not None:
