@@ -978,37 +978,45 @@ class IdalibSupervisor:
     ) -> dict[str, Any]:
         """Drop *context_id*'s binding to *session_id*, refcounted.
 
-        Flow (per the agreed "state lock for dicts, session lock for
-        work" architecture):
+        Flow uses the state→session hand-off pattern to avoid any
+        window where the session reference could go stale between
+        lookup and lock acquisition:
 
-        1. State lock (brief): find the session.
-        2. Acquire session lock OUTSIDE the state lock so that other
-           ops on other binaries are unaffected.
-        3. State lock (brief, nested): re-verify the session is still
-           registered (a concurrent close from another caller might
-           have torn it down between steps 1 and 2) and check whether
-           this context actually holds a binding.
-        4. Save the IDB under session lock only (no state lock).
-        5. State lock (brief, nested): atomically pop our binding,
-           count how many bindings are LEFT on this session, and — if
-           none are left — unregister the session from sessions/
-           path_to_session. The atomic count-and-maybe-unregister is
-           what catches a concurrent ``open_session`` that added a
-           binding while we were saving: such a binding shows up in
-           the count, so we don't unregister.
-        6. Terminate the worker under session lock only (no state
-           lock). A concurrent same-session close that's queued on
-           session.lock will wake up to find the worker dead and
-           surface ``saved=False`` with a clear error.
+        1. Acquire state lock, look up the session, acquire
+           session.lock WHILE STILL HOLDING state, release state.
+           The session.lock is now held atomically w.r.t. the lookup.
+        2. Save the IDB under session.lock only (no state held).
+        3. Release session.lock, then acquire state lock alone for
+           pop + count + maybe-unregister (atomic).
+        4. Terminate the worker without holding any lock.
+
+        Why the hand-off (state→session→release state) instead of
+        "state, release, session": the gap between releasing state
+        and acquiring session.lock would otherwise let another close
+        terminate the worker, leaving us holding session.lock on a
+        ghost session. Hand-off closes that window.
+
+        Why session.lock is released BEFORE the pop+count step: if
+        we kept session.lock through the pop, a concurrent same-
+        session close would queue behind us — that's fine — but it
+        would ALSO be queueing behind us while holding state (its
+        own hand-off acquire was waiting on our session.lock). That
+        starves every other state operation. By releasing session.lock
+        before retaking state, we let other concurrent closes proceed
+        on their own timeline; the pop+count itself is atomic under
+        state lock so a concurrent open's mid-save binding still gets
+        counted.
 
         Lock invariants:
-        * ``session.lock → self._lock`` nesting is allowed.
-        * ``self._lock → session.lock`` is forbidden by convention.
-          Any operation that needs both must acquire session.lock
-          OUTSIDE self._lock (i.e. release self._lock between the
-          dict lookup and the session.lock acquire).
+        * The ONLY acquisition order is state → session. Reversing it
+          (session → state) is forbidden.
+        * session.lock is released BEFORE any retake of state, so
+          there is no nested holding.
         """
-        # Step 1 — brief state lock: find session.
+        # Phase A — state → session hand-off, atomic.
+        # Lookup + had_binding check happen under state, then we
+        # acquire session.lock under state, then release state. The
+        # session reference cannot go stale during this window.
         with self._lock:
             session = self.sessions.get(session_id)
             if session is None:
@@ -1018,77 +1026,67 @@ class IdalibSupervisor:
                     "terminated": False,
                     "error": f"Session not found: {session_id}",
                 }
+            had_binding = self.context_bindings.get(context_id) == session_id
+            # Acquiring session.lock here may block if another close
+            # holds it. We accept blocking while holding state — only
+            # concurrent same-session releases stall here.
+            session.lock.acquire()
 
-        # Step 2 — acquire session lock outside state lock.
-        with session.lock:
-            # Step 3 — re-verify under state lock.
-            with self._lock:
-                if session_id not in self.sessions:
-                    return {
-                        "success": False,
-                        "released": False,
-                        "terminated": False,
-                        "error": (
-                            f"Session {session_id} was torn down before "
-                            "we could acquire its lock."
-                        ),
-                    }
-                had_binding = self.context_bindings.get(context_id) == session_id
-
-            # Step 4 — save (no state lock).
+        try:
+            # Phase B — save under session.lock only.
             saved, save_error = (False, None)
             if had_binding:
                 saved, save_error = self._save_session_idb(session)
+        finally:
+            session.lock.release()
 
-            # Step 5 — atomic pop + count + maybe unregister under
-            # state lock. The count INCLUDES bindings added by a
-            # concurrent open during the save above (open takes state
-            # lock briefly, doesn't touch session lock), so we
-            # naturally back out of the terminate when someone joined
-            # mid-save.
-            with self._lock:
-                if had_binding:
-                    self.context_bindings.pop(context_id, None)
-                remaining = sum(
-                    1 for b in self.context_bindings.values() if b == session_id
-                )
-                if had_binding and remaining == 0:
-                    popped = self._unregister_session_locked(session_id)
-                else:
-                    popped = None
+        # Phase C — state lock alone for the bookkeeping mutation.
+        # Releasing session.lock before retaking state keeps lock
+        # order strictly state→session and prevents head-of-line
+        # blocking when many closes pile up on this session.
+        with self._lock:
+            if had_binding:
+                self.context_bindings.pop(context_id, None)
+            remaining = sum(
+                1 for b in self.context_bindings.values() if b == session_id
+            )
+            if had_binding and remaining == 0:
+                popped = self._unregister_session_locked(session_id)
+            else:
+                popped = None
 
-            if popped is None:
-                # Not the last holder (or we weren't bound at all).
-                return {
-                    "success": True,
-                    "released": had_binding,
-                    "terminated": False,
-                    "remaining_refs": remaining,
-                    "saved": saved,
-                    "save_error": save_error,
-                }
-
-            # Step 6 — terminate under session.lock.
-            if popped.backend == "worker":
-                try:
-                    self.call_worker_tool(
-                        popped, "idalib_close", {"session_id": session_id}
-                    )
-                except Exception:
-                    logger.debug(
-                        "Worker idalib_close failed for %s",
-                        session_id,
-                        exc_info=True,
-                    )
-            self._terminate_worker(popped)
+        if popped is None:
             return {
                 "success": True,
-                "released": True,
-                "terminated": True,
-                "remaining_refs": 0,
+                "released": had_binding,
+                "terminated": False,
+                "remaining_refs": remaining,
                 "saved": saved,
                 "save_error": save_error,
             }
+
+        # Phase D — terminate with no locks held. The session is
+        # already unregistered, so no other call can find it.
+        if popped.backend == "worker":
+            try:
+                self.call_worker_tool(
+                    popped, "idalib_close", {"session_id": session_id}
+                )
+            except Exception:
+                logger.debug(
+                    "Worker idalib_close failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+        self._terminate_worker(popped)
+        return {
+            "success": True,
+            "released": True,
+            "terminated": True,
+            "remaining_refs": 0,
+            "saved": saved,
+            "save_error": save_error,
+        }
 
     def _save_session_idb(self, session: WorkerSession) -> tuple[bool, str | None]:
         """Persist *session*'s IDB to disk via the worker. Returns (ok, err)."""
