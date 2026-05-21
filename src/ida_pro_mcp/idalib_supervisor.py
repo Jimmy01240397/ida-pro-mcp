@@ -21,6 +21,7 @@ import sys
 import time
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -730,7 +731,7 @@ class IdalibSupervisor:
         requested_session_id = session_id
 
         with self._lock:
-            # 1. Live session for this path → reuse.
+            # 1. Live session for this path → reuse with hand-off.
             existing_sid = self.path_to_session.get(path_key)
             if existing_sid is not None:
                 session = self.sessions.get(existing_sid)
@@ -740,9 +741,18 @@ class IdalibSupervisor:
                             f"Binary already open as session '{existing_sid}', cannot reuse "
                             f"different session_id '{requested_session_id}'."
                         )
-                    session.last_accessed = datetime.now()
-                    if context_id is not None:
-                        self.bind_context(context_id, existing_sid)
+                    # State→session hand-off: acquire session.lock
+                    # under the state lock so the session ref is
+                    # guaranteed valid for the bind below. Releasing
+                    # session.lock back here is fine — the bind has
+                    # already updated context_bindings under state.
+                    session.lock.acquire()
+                    try:
+                        session.last_accessed = datetime.now()
+                        if context_id is not None:
+                            self.bind_context(context_id, existing_sid)
+                    finally:
+                        session.lock.release()
                     return session
                 # Stale — drop it before starting fresh.
                 self._unregister_session_locked(existing_sid)
@@ -801,11 +811,17 @@ class IdalibSupervisor:
                 raise pending.error
             session = self.sessions.get(pending.session_id)
             if session is not None and session.is_alive():
-                # Late-arriving context_id: make sure it's bound before
-                # we hand the session back.
-                if context_id and self.context_bindings.get(context_id) != session.session_id:
-                    self.bind_context(context_id, session.session_id)
-                session.last_accessed = datetime.now()
+                # State→session hand-off for the late-arrival bind:
+                # acquire session.lock under state so a concurrent
+                # close can't terminate the session between this
+                # check and the bind.
+                session.lock.acquire()
+                try:
+                    if context_id and self.context_bindings.get(context_id) != session.session_id:
+                        self.bind_context(context_id, session.session_id)
+                    session.last_accessed = datetime.now()
+                finally:
+                    session.lock.release()
                 return session
             return pending.to_status_dict()
 
@@ -1187,70 +1203,130 @@ class IdalibSupervisor:
             raise reopen_error
         raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
 
-    def resolve_session(self, database: str | None = None) -> WorkerSession:
-        with self._lock:
-            session_id: str | None = None
-            if database:
-                matches: list[str] = [database] if database in self.sessions else []
-                if not matches:
-                    try:
-                        mapped = self.path_to_session.get(self._path_key(database))
-                    except Exception:
-                        mapped = self.path_to_session.get(os.path.normcase(database))
-                    if mapped is not None:
-                        matches = [mapped]
-                if not matches:
-                    matches = [
-                        s.session_id
-                        for s in self.sessions.values()
-                        if database in {s.session_id, s.filename, s.input_path}
-                        or os.path.normcase(database) == os.path.normcase(s.input_path)
-                    ]
-                if not matches:
-                    # Try resolved path match without requiring it to exist now.
-                    try:
-                        normalized = os.path.normcase(str(Path(database).resolve()))
-                    except Exception:
-                        normalized = os.path.normcase(database)
-                    matches = [
-                        s.session_id
-                        for s in self.sessions.values()
-                        if os.path.normcase(s.input_path) == normalized
-                    ]
-                if len(matches) > 1:
-                    raise RuntimeError(f"Database selector is ambiguous: {database}")
-                if not matches:
-                    # Friendlier message when the caller is using a
-                    # session_id from an in-flight idalib_open.
-                    for pending in self._pending.values():
-                        if database in (pending.session_id, pending.resolved_path):
-                            raise RuntimeError(
-                                f"Session {pending.session_id} is still opening "
-                                f"(elapsed={pending.elapsed_seconds:.1f}s). "
-                                f"Call idalib_open again to wait for it to be ready."
-                            )
-                    raise RuntimeError(f"Database/session not found: {database}")
-                session_id = matches[0]
-            else:
-                context_id = self.resolve_context_id()
-                session_id = self.context_bindings.get(context_id)
-                if session_id is None and not self.isolated_contexts:
-                    session_id = self.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
-                if session_id is None:
-                    raise RuntimeError(
-                        "No database bound for this context. Use idalib_open(...), "
-                        "idalib_switch(session_id), or pass database=..."
-                    )
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise RuntimeError(f"Session is stale or missing: {session_id}")
-            session.last_accessed = datetime.now()
+    @contextmanager
+    def session_scope(self, database: str | None = None):
+        """Resolve a session and hold its lock for the body of the
+        ``with`` block. State→session hand-off:
 
+            with self._lock:
+                session = resolve(database)
+                session.lock.acquire()
+            # state released, session.lock held
+
+        Yields the session; releases ``session.lock`` on exit. Callers
+        do NOT need their own ``self._lock`` acquisition for this
+        session — the hand-off above is atomic.
+
+        For sessions whose worker is no longer alive but were attached
+        via the GUI backend, the manager reopens them headlessly
+        before yielding. Headless reopen happens OUTSIDE the original
+        session.lock (a new ``WorkerSession`` with a fresh lock is
+        produced) — the yielded session is the replacement.
+        """
+        with self._lock:
+            session = self._resolve_session_locked(database)
+            session.last_accessed = datetime.now()
+            # Cheap probe — for worker backend, just process.poll();
+            # for GUI we punt to the reopen path outside the lock.
+            if session.backend == "worker" and session.is_alive():
+                session.lock.acquire()
+                holding = session
+            else:
+                holding = None
+        # state released
+
+        if holding is None:
+            # GUI backend dead, or worker session died. Try to reopen.
+            if session.backend == "gui":
+                replacement = self._reopen_gui_session_headless(session)
+                replacement.lock.acquire()
+                holding = replacement
+            else:
+                raise RuntimeError(
+                    f"Worker for session '{session.session_id}' is not running"
+                )
+
+        try:
+            yield holding
+        finally:
+            holding.lock.release()
+
+    def _resolve_session_locked(self, database: str | None) -> WorkerSession:
+        """Internal resolve, callable only while ``self._lock`` is held."""
+        session_id: str | None = None
+        if database:
+            matches: list[str] = [database] if database in self.sessions else []
+            if not matches:
+                try:
+                    mapped = self.path_to_session.get(self._path_key(database))
+                except Exception:
+                    mapped = self.path_to_session.get(os.path.normcase(database))
+                if mapped is not None:
+                    matches = [mapped]
+            if not matches:
+                matches = [
+                    s.session_id
+                    for s in self.sessions.values()
+                    if database in {s.session_id, s.filename, s.input_path}
+                    or os.path.normcase(database) == os.path.normcase(s.input_path)
+                ]
+            if not matches:
+                try:
+                    normalized = os.path.normcase(str(Path(database).resolve()))
+                except Exception:
+                    normalized = os.path.normcase(database)
+                matches = [
+                    s.session_id
+                    for s in self.sessions.values()
+                    if os.path.normcase(s.input_path) == normalized
+                ]
+            if len(matches) > 1:
+                raise RuntimeError(f"Database selector is ambiguous: {database}")
+            if not matches:
+                for pending in self._pending.values():
+                    if database in (pending.session_id, pending.resolved_path):
+                        raise RuntimeError(
+                            f"Session {pending.session_id} is still opening "
+                            f"(elapsed={pending.elapsed_seconds:.1f}s). "
+                            f"Call idalib_open again to wait for it to be ready."
+                        )
+                raise RuntimeError(f"Database/session not found: {database}")
+            session_id = matches[0]
+        else:
+            context_id = self.resolve_context_id()
+            session_id = self.context_bindings.get(context_id)
+            if session_id is None and not self.isolated_contexts:
+                session_id = self.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
+            if session_id is None:
+                raise RuntimeError(
+                    "No database bound for this context. Use idalib_open(...), "
+                    "idalib_switch(session_id), or pass database=..."
+                )
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise RuntimeError(f"Session is stale or missing: {session_id}")
+        return session
+
+    def resolve_session(self, database: str | None = None) -> WorkerSession:
+        """Resolve a database selector to a live WorkerSession.
+
+        Does NOT acquire ``session.lock`` — kept for paths that pass
+        the session ref around without doing slow work on it (e.g.
+        tests, ``idalib_current`` read-only inspection). For any path
+        that actually does work on a session, prefer
+        :meth:`session_scope` so the state→session hand-off closes the
+        lookup-vs-tear-down window.
+        """
+        with self._lock:
+            session = self._resolve_session_locked(database)
+            session.last_accessed = datetime.now()
         if session.is_alive():
             return session
         if session.backend == "gui":
             return self._reopen_gui_session_headless(session)
-        raise RuntimeError(f"Worker for session '{session_id}' is not running")
+        raise RuntimeError(
+            f"Worker for session '{session.session_id}' is not running"
+        )
 
     def list_sessions(self, context_id: str) -> list[IdalibSessionListInfo]:
         with self._lock:
@@ -1463,14 +1539,17 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        sup.bind_context(context_id, session.session_id)
-        return {
-            "success": True,
-            **sup.context_fields(context_id),
-            "session": session.to_dict(),
-            "message": f"Bound context to session: {session.session_id} ({session.filename})",
-        }
+        # Hand-off: resolve session + acquire its lock atomically, so a
+        # concurrent close can't terminate the session between resolve
+        # and bind.
+        with sup.session_scope(session_id) as session:
+            sup.bind_context(context_id, session.session_id)
+            return {
+                "success": True,
+                **sup.context_fields(context_id),
+                "session": session.to_dict(),
+                "message": f"Bound context to session: {session.session_id} ({session.filename})",
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1525,8 +1604,8 @@ def idalib_current() -> IdalibCurrentResult:
                 "error": "No session bound for this context. Use idalib_open(...) or idalib_switch(session_id) first.",
                 **sup.context_fields(context_id),
             }
-        session = sup.resolve_session(session_id)
-        return {**session.to_dict(), **sup.context_fields(context_id)}
+        with sup.session_scope(session_id) as session:
+            return {**session.to_dict(), **sup.context_fields(context_id)}
     except Exception as e:
         return {"error": f"Failed to get current session: {e}"}
 
@@ -1540,14 +1619,14 @@ def idalib_save(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-        tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
-        result = sup.call_worker_tool(session, tool_name, {"path": path})
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ok": False, **sup.context_fields(context_id), "error": "Unexpected save result"}
+        with sup.session_scope(session_id) as session:
+            if session_id:
+                sup.bind_context(context_id, session.session_id)
+            tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
+            result = sup.call_worker_tool(session, tool_name, {"path": path})
+            if isinstance(result, dict):
+                return {**result, **sup.context_fields(context_id)}
+            return {"ok": False, **sup.context_fields(context_id), "error": "Unexpected save result"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1560,22 +1639,22 @@ def idalib_health(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-        if session.backend == "gui":
-            health = sup.call_worker_tool(session, "server_health", {})
-            return {
-                "ready": bool(isinstance(health, dict) and not health.get("error")),
-                **sup.context_fields(context_id),
-                "session": session.to_dict(),
-                "health": health if isinstance(health, dict) else None,
-                "error": None,
-            }
-        result = sup.call_worker_tool(session, "idalib_health", {})
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ready": False, **sup.context_fields(context_id), "session": None, "health": None, "error": "Unexpected health result"}
+        with sup.session_scope(session_id) as session:
+            if session_id:
+                sup.bind_context(context_id, session.session_id)
+            if session.backend == "gui":
+                health = sup.call_worker_tool(session, "server_health", {})
+                return {
+                    "ready": bool(isinstance(health, dict) and not health.get("error")),
+                    **sup.context_fields(context_id),
+                    "session": session.to_dict(),
+                    "health": health if isinstance(health, dict) else None,
+                    "error": None,
+                }
+            result = sup.call_worker_tool(session, "idalib_health", {})
+            if isinstance(result, dict):
+                return {**result, **sup.context_fields(context_id)}
+            return {"ready": False, **sup.context_fields(context_id), "session": None, "health": None, "error": "Unexpected health result"}
     except Exception as e:
         return {"ready": False, "error": str(e)}
 
@@ -1591,38 +1670,38 @@ def idalib_warmup(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-        if session.backend == "gui":
-            warmup = sup.call_worker_tool(
+        with sup.session_scope(session_id) as session:
+            if session_id:
+                sup.bind_context(context_id, session.session_id)
+            if session.backend == "gui":
+                warmup = sup.call_worker_tool(
+                    session,
+                    "server_warmup",
+                    {
+                        "wait_auto_analysis": wait_auto_analysis,
+                        "build_caches": build_caches,
+                        "init_hexrays": init_hexrays,
+                    },
+                )
+                return {
+                    "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
+                    **sup.context_fields(context_id),
+                    "session": session.to_dict(),
+                    "warmup": warmup if isinstance(warmup, dict) else None,
+                    "error": None,
+                }
+            result = sup.call_worker_tool(
                 session,
-                "server_warmup",
+                "idalib_warmup",
                 {
                     "wait_auto_analysis": wait_auto_analysis,
                     "build_caches": build_caches,
                     "init_hexrays": init_hexrays,
                 },
             )
-            return {
-                "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
-                **sup.context_fields(context_id),
-                "session": session.to_dict(),
-                "warmup": warmup if isinstance(warmup, dict) else None,
-                "error": None,
-            }
-        result = sup.call_worker_tool(
-            session,
-            "idalib_warmup",
-            {
-                "wait_auto_analysis": wait_auto_analysis,
-                "build_caches": build_caches,
-                "init_hexrays": init_hexrays,
-            },
-        )
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
+            if isinstance(result, dict):
+                return {**result, **sup.context_fields(context_id)}
+            return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
     except Exception as e:
         return {"ready": False, "error": str(e)}
 
@@ -1671,15 +1750,15 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     arguments = copy.deepcopy(params.get("arguments") or {})
     database = arguments.pop(_DATABASE_ARG, None)
-    try:
-        session = sup.resolve_session(database)
-    except Exception as e:
-        return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
-
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
-        return sup.forward_raw(session, forwarded)
+        # Hand-off: resolve session and hold its lock while the tool
+        # runs. Same-session tool calls serialise here; cross-session
+        # calls run in parallel. Also serialises with close so the
+        # worker can't be terminated mid-tool.
+        with sup.session_scope(database) as session:
+            return sup.forward_raw(session, forwarded)
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
@@ -1704,8 +1783,8 @@ def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None
     if uri == "ida://databases":
         return _original_dispatch(request_obj)
     try:
-        session = sup.resolve_session(None)
-        return sup.forward_raw(session, request_obj)
+        with sup.session_scope(None) as session:
+            return sup.forward_raw(session, request_obj)
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
 
@@ -1735,11 +1814,12 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
     if method in {"prompts/list", "prompts/get"}:
         return _original_dispatch(request_obj)
 
+    sup = _require_supervisor()
     try:
-        session = _require_supervisor().resolve_session(None)
+        with sup.session_scope(None) as session:
+            return sup.forward_raw(session, request_obj)
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
-    return _require_supervisor().forward_raw(session, request_obj)
 
 
 def main() -> None:
