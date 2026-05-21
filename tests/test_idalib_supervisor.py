@@ -832,19 +832,24 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     t_close.start()
     assert save_started.wait(timeout=2.0)
 
-    # B opens during A's save. self._lock is NOT held by close's
-    # Phase B (save), so B's open runs freely.
+    # B opens during A's save. The state lock is NOT held during
+    # close's save (it sits in session.lock only), so B's open runs
+    # freely. The pop of ctxA happens AFTER save in step 5, so
+    # during the save itself ctxA is still logically bound — that's
+    # the "binding lives until save completes" contract.
     open_session = sup.open_session(
         str(sample), session_id="solo", context_id="ctxB"
     )
     assert open_session is worker_session, (
         "open should reuse the same WorkerSession, not spawn a new one"
     )
-    assert sup.context_bindings == {"ctxB": "solo"}, (
-        f"ctxB should be bound while ctxA's close is mid-save, got {sup.context_bindings}"
+    # Mid-save: both ctxA (not yet popped) and ctxB (just bound) are present.
+    assert sup.context_bindings == {"ctxA": "solo", "ctxB": "solo"}, (
+        f"both bindings should exist mid-save, got {sup.context_bindings}"
     )
 
-    # Let A's close finish — Phase C recheck will see B's late binding.
+    # Let A's close finish — step 5 pops ctxA, counts ctxB remaining,
+    # backs out of terminate.
     save_can_finish.set()
     t_close.join(timeout=3.0)
     assert not t_close.is_alive()
@@ -859,6 +864,7 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     # Worker is the same process — not torn down.
     assert "solo" in sup.sessions
     assert sup.sessions["solo"].process is pre_close_process
+    # After close returns, only ctxB remains.
     assert sup.context_bindings == {"ctxB": "solo"}
 
 

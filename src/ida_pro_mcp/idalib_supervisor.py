@@ -978,42 +978,37 @@ class IdalibSupervisor:
     ) -> dict[str, Any]:
         """Drop *context_id*'s binding to *session_id*, refcounted.
 
-        Locking architecture (4 phases):
+        Flow (per the agreed "state lock for dicts, session lock for
+        work" architecture):
 
-        * **Phase A** — ``self._lock`` (state lock, brief): find the
-          session, pop ``context_id`` from ``context_bindings``,
-          compute ``is_last``. Held just long enough to do the dict
-          mutation; no I/O.
-        * **Phase B** — ``session.lock`` (per-session, long-running):
-          save the IDB. Two concurrent ``release_session`` calls on
-          the same session serialise here; one finishes its save
-          before the next acquires.
-        * **Phase C** — ``self._lock`` (brief, NESTED inside
-          ``session.lock``): if we were the last ref, recheck
-          ``context_bindings`` to catch a concurrent ``open_session``
-          that added a binding during our save, and either unregister
-          the session or back out of termination. Lock order is
-          ``session.lock → self._lock``; the reverse is forbidden by
-          convention so we never deadlock.
-        * **Phase D** — ``session.lock`` only: actually terminate the
-          worker process. Any further save attempt on this session
-          (from another thread that's waiting on ``session.lock``)
-          will wake up to find the worker dead and report
-          ``saved=False``.
+        1. State lock (brief): find the session.
+        2. Acquire session lock OUTSIDE the state lock so that other
+           ops on other binaries are unaffected.
+        3. State lock (brief, nested): re-verify the session is still
+           registered (a concurrent close from another caller might
+           have torn it down between steps 1 and 2) and check whether
+           this context actually holds a binding.
+        4. Save the IDB under session lock only (no state lock).
+        5. State lock (brief, nested): atomically pop our binding,
+           count how many bindings are LEFT on this session, and — if
+           none are left — unregister the session from sessions/
+           path_to_session. The atomic count-and-maybe-unregister is
+           what catches a concurrent ``open_session`` that added a
+           binding while we were saving: such a binding shows up in
+           the count, so we don't unregister.
+        6. Terminate the worker under session lock only (no state
+           lock). A concurrent same-session close that's queued on
+           session.lock will wake up to find the worker dead and
+           surface ``saved=False`` with a clear error.
 
-        Three outcomes:
-
-        * Session unknown → ``{"success": False, "error": ...}``.
-        * Session exists but *context_id* wasn't bound to it →
-          ``{"success": True, "released": False, "terminated": False,
-          "remaining_refs": <int>}``.
-        * This context was the last holder → save, terminate, return
-          ``{"terminated": True, "saved": <bool>}``.
-        * Other contexts still hold the binary → just unbind ours,
-          save the IDB so this agent's edits persist, return
-          ``{"terminated": False, "remaining_refs": <int>}``.
+        Lock invariants:
+        * ``session.lock → self._lock`` nesting is allowed.
+        * ``self._lock → session.lock`` is forbidden by convention.
+          Any operation that needs both must acquire session.lock
+          OUTSIDE self._lock (i.e. release self._lock between the
+          dict lookup and the session.lock acquire).
         """
-        # Phase A: state lock, brief — pop our binding, decide is_last.
+        # Step 1 — brief state lock: find session.
         with self._lock:
             session = self.sessions.get(session_id)
             if session is None:
@@ -1023,25 +1018,47 @@ class IdalibSupervisor:
                     "terminated": False,
                     "error": f"Session not found: {session_id}",
                 }
-            bound = self._bound_context_ids_locked(session_id)
-            had_binding = context_id in bound
-            if had_binding:
-                self.context_bindings.pop(context_id, None)
-                bound = [ctx for ctx in bound if ctx != context_id]
-            remaining = len(bound)
-            is_last = had_binding and remaining == 0
 
-        # Phase B: session lock, long-running save. Cross-binary
-        # operations on OTHER sessions can proceed in parallel.
-        # Two concurrent releases on the SAME session serialise here.
+        # Step 2 — acquire session lock outside state lock.
         with session.lock:
+            # Step 3 — re-verify under state lock.
+            with self._lock:
+                if session_id not in self.sessions:
+                    return {
+                        "success": False,
+                        "released": False,
+                        "terminated": False,
+                        "error": (
+                            f"Session {session_id} was torn down before "
+                            "we could acquire its lock."
+                        ),
+                    }
+                had_binding = self.context_bindings.get(context_id) == session_id
+
+            # Step 4 — save (no state lock).
             saved, save_error = (False, None)
             if had_binding:
                 saved, save_error = self._save_session_idb(session)
 
-            if not is_last:
-                # Not the last holder — we're done. Worker stays alive
-                # for the remaining contexts.
+            # Step 5 — atomic pop + count + maybe unregister under
+            # state lock. The count INCLUDES bindings added by a
+            # concurrent open during the save above (open takes state
+            # lock briefly, doesn't touch session lock), so we
+            # naturally back out of the terminate when someone joined
+            # mid-save.
+            with self._lock:
+                if had_binding:
+                    self.context_bindings.pop(context_id, None)
+                remaining = sum(
+                    1 for b in self.context_bindings.values() if b == session_id
+                )
+                if had_binding and remaining == 0:
+                    popped = self._unregister_session_locked(session_id)
+                else:
+                    popped = None
+
+            if popped is None:
+                # Not the last holder (or we weren't bound at all).
                 return {
                     "success": True,
                     "released": had_binding,
@@ -1051,28 +1068,7 @@ class IdalibSupervisor:
                     "save_error": save_error,
                 }
 
-            # Phase C: nested state lock inside session lock — recheck
-            # for late bindings and either unregister or back out.
-            with self._lock:
-                late_refs = self._bound_context_ids_locked(session_id)
-                if late_refs:
-                    # A concurrent open bound a new context during our
-                    # save. Worker stays alive for them.
-                    return {
-                        "success": True,
-                        "released": True,
-                        "terminated": False,
-                        "remaining_refs": len(late_refs),
-                        "saved": saved,
-                        "save_error": save_error,
-                    }
-                popped = self._unregister_session_locked(session_id)
-            if popped is None:
-                popped = session  # shouldn't happen, but be defensive
-
-            # Phase D: terminate, still under session.lock so any
-            # concurrent same-session save waiting on session.lock
-            # sees a dead worker rather than a half-torn-down one.
+            # Step 6 — terminate under session.lock.
             if popped.backend == "worker":
                 try:
                     self.call_worker_tool(
