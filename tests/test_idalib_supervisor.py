@@ -266,7 +266,7 @@ def test_open_session_removes_stale_existing_mapping(tmp_path):
             filename="sample.bin",
             process=_DeadProcess(),
         )
-        with sup._lock:
+        with sup._rw_lock.write():
             sup._register_session_locked(stale, str(sample.resolve()), "ctx")
         session = sup.open_session(str(sample), session_id="new", context_id="ctx")
         assert session.session_id == "new"
@@ -291,7 +291,7 @@ def test_open_session_ignores_dead_workers_for_max_worker_limit(tmp_path):
             filename="stale.bin",
             process=_DeadProcess(),
         )
-        with sup._lock:
+        with sup._rw_lock.write():
             sup._register_session_locked(stale, str(stale_path.resolve()), "ctx")
 
         session = sup.open_session(str(new_path), session_id="new", context_id="ctx")
@@ -317,7 +317,7 @@ def test_open_session_race_discards_losing_worker_for_existing_path(tmp_path):
                     filename="sample.bin",
                     process=_FakeProcess(),
                 )
-                with self._lock:
+                with self._rw_lock.write():
                     self._register_session_locked(existing, str(sample.resolve()), None)
             return result
 
@@ -346,7 +346,7 @@ def test_open_session_race_rejects_different_requested_session_id(tmp_path):
                     filename="sample.bin",
                     process=_FakeProcess(),
                 )
-                with self._lock:
+                with self._rw_lock.write():
                     self._register_session_locked(existing, str(sample.resolve()), None)
             return result
 
@@ -389,7 +389,7 @@ def test_open_session_race_rejects_duplicate_session_id_for_different_path(tmp_p
                     filename="first.bin",
                     process=_FakeProcess(),
                 )
-                with self._lock:
+                with self._rw_lock.write():
                     self._register_session_locked(existing, str(first.resolve()), None)
             return result
 
@@ -793,13 +793,13 @@ def test_concurrent_release_from_two_agents_terminates_exactly_once(tmp_path):
     assert sup.context_bindings == {}
 
 
-def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
-    """A is the final ref and is mid-save. B opens the same path while
-    A's save is in flight. Because save runs under session.lock (NOT
-    self._lock), B's open can take self._lock briefly, see the live
-    session, and add a binding. A's post-save recheck (Phase C, brief
-    self._lock under session.lock) sees B's binding and BACKS OUT of
-    the terminate — worker stays alive for B.
+def test_release_session_concurrent_open_blocks_on_write_lock(tmp_path):
+    """Under the RW-lock architecture, close holds the global write
+    lock throughout (including the save). A concurrent open arriving
+    during the save BLOCKS on the write lock until close finishes;
+    by then the session has been unregistered (final-ref close) or
+    its refcount has been preserved (non-final close). The open then
+    runs to completion under its own write lock.
     """
     import threading as _threading
     import time as _time
@@ -808,8 +808,6 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     sample.write_bytes(b"x")
     sup = _make_saving_sup()
     sup.open_session(str(sample), session_id="solo", context_id="ctxA")
-    worker_session = sup.sessions["solo"]
-    pre_close_process = worker_session.process
 
     save_started = _threading.Event()
     save_can_finish = _threading.Event()
@@ -832,45 +830,49 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     t_close.start()
     assert save_started.wait(timeout=2.0)
 
-    # B opens during A's save. The state lock is NOT held during
-    # close's save (it sits in session.lock only), so B's open runs
-    # freely. The pop of ctxA happens AFTER save in step 5, so
-    # during the save itself ctxA is still logically bound — that's
-    # the "binding lives until save completes" contract.
-    open_session = sup.open_session(
-        str(sample), session_id="solo", context_id="ctxB"
-    )
-    assert open_session is worker_session, (
-        "open should reuse the same WorkerSession, not spawn a new one"
-    )
-    # Mid-save: both ctxA (not yet popped) and ctxB (just bound) are present.
-    assert sup.context_bindings == {"ctxA": "solo", "ctxB": "solo"}, (
-        f"both bindings should exist mid-save, got {sup.context_bindings}"
-    )
+    # B's open in another thread should block on the write lock —
+    # close holds write lock throughout its save.
+    open_done = _threading.Event()
+    open_result: list = []
 
-    # Let A's close finish — step 5 pops ctxA, counts ctxB remaining,
-    # backs out of terminate.
+    def do_open():
+        try:
+            open_result.append(
+                sup.open_session(str(sample), session_id="solo", context_id="ctxB")
+            )
+        finally:
+            open_done.set()
+
+    t_open = _threading.Thread(target=do_open)
+    t_open.start()
+    _time.sleep(0.1)
+    assert not open_done.is_set(), "open should be blocked on the write lock during close's save"
+
+    # Let close finish — write lock is released, open proceeds.
     save_can_finish.set()
     t_close.join(timeout=3.0)
+    t_open.join(timeout=3.0)
     assert not t_close.is_alive()
+    assert not t_open.is_alive()
 
+    # Close was the last ref → terminated. Open then spawned a fresh
+    # worker for "solo" (the session_id was no longer in use).
     outcome = close_result["r"]
     assert outcome["released"] is True
-    assert outcome["terminated"] is False, (
-        f"close should have backed out of terminate; got {outcome}"
-    )
-    assert outcome["remaining_refs"] == 1
+    assert outcome["terminated"] is True
     assert outcome["saved"] is True
-    # Worker is the same process — not torn down.
+    assert open_result, "open did not complete"
     assert "solo" in sup.sessions
-    assert sup.sessions["solo"].process is pre_close_process
-    # After close returns, only ctxB remains.
     assert sup.context_bindings == {"ctxB": "solo"}
 
 
-def test_release_session_does_not_block_other_session_close(tmp_path):
-    """Cross-binary closes run in parallel — per-session lock means
-    one binary's close doesn't stall another binary's close.
+def test_release_session_serialises_with_other_session_close(tmp_path):
+    """Cross-binary closes serialise on the global write lock under
+    the RW architecture. This is the explicit trade-off of using a
+    global write lock for open/close — close is "structural" and
+    blocks everyone, in exchange for closing every concurrent-open
+    race against a dying worker (no transient two-worker overlap on
+    the same .i64).
     """
     import threading as _threading
     import time as _time
@@ -901,14 +903,17 @@ def test_release_session_does_not_block_other_session_close(tmp_path):
     tb = _threading.Thread(target=close, args=("B", "ctxB"))
     ta.start()
     tb.start()
-    ta.join(timeout=2.0)
-    tb.join(timeout=2.0)
+    ta.join(timeout=3.0)
+    tb.join(timeout=3.0)
     elapsed = _time.monotonic() - t0
 
-    # If closes serialised on a global lock, elapsed ≈ 0.6s. With
-    # per-session locks, they overlap and elapsed ≈ 0.3s.
-    assert elapsed < 0.5, (
-        f"cross-binary closes serialised (elapsed={elapsed:.2f}s); per-session lock not in effect"
+    # Both closes hold the global write lock for ~0.3s each, so the
+    # total elapsed is ~0.6s. If a future refactor reintroduced
+    # parallelism (e.g. per-binary write lock) this would drop to
+    # ~0.3s — that would be a behaviour change worth re-checking.
+    assert elapsed >= 0.5, (
+        f"closes appear to be running in parallel (elapsed={elapsed:.2f}s); "
+        f"global write lock should have serialised them to ~0.6s"
     )
     assert results["A"]["terminated"] is True
     assert results["B"]["terminated"] is True
@@ -1094,7 +1099,7 @@ def test_bind_context_blocks_while_supervisor_lock_is_held():
     finish_holding = _threading.Event()
 
     def hold_lock():
-        with sup._lock:
+        with sup._rw_lock.write():
             lock_held.set()
             finish_holding.wait(timeout=2.0)
 
@@ -1133,7 +1138,7 @@ def test_unbind_context_blocks_while_supervisor_lock_is_held():
     finish_holding = _threading.Event()
 
     def hold_lock():
-        with sup._lock:
+        with sup._rw_lock.write():
             lock_held.set()
             finish_holding.wait(timeout=2.0)
 

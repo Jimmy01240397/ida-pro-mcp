@@ -25,8 +25,63 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import Condition
 from typing import Annotated, Any, NotRequired, Optional, TypedDict, Union
+
+
+class _RWLock:
+    """Writer-preference readers-writer lock.
+
+    * Multiple ``read()`` holders may be active simultaneously.
+    * ``write()`` is exclusive against both readers and other writers.
+    * Once a writer is waiting, no NEW readers may acquire — existing
+      readers drain, then the writer goes through, then readers are
+      allowed again. Prevents writer starvation under a constant
+      stream of readers.
+    """
+
+    def __init__(self) -> None:
+        self._cond = Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def read(self):
+        with self._cond:
+            while self._writer or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self):
+        with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers > 0:
+                    self._cond.wait()
+                self._writers_waiting -= 1
+                self._writer = True
+            except BaseException:
+                # If wait() raises (e.g. KeyboardInterrupt), we must
+                # not leave _writers_waiting incremented or no one will
+                # ever acquire.
+                self._writers_waiting -= 1
+                self._cond.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
 
 
 logger = logging.getLogger(__name__)
@@ -331,7 +386,18 @@ class IdalibSupervisor:
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
-        self._lock = RLock()
+        # One global readers-writer lock for all cross-binary state
+        # (sessions / path_to_session / context_bindings / _pending):
+        #   * read()  — for tools whose work is per-binary HTTP
+        #               (forward_raw, idalib_save / health / warmup,
+        #               idalib_list / current / list_pending). Multiple
+        #               readers run concurrently; same-binary work
+        #               serialises further on the per-session lock.
+        #   * write() — for open, close, switch, unbind. Exclusive
+        #               against both readers and other writers.
+        # Lock order is ALWAYS rw_lock → session.lock (the read or
+        # write block is the outer scope). Never reverse.
+        self._rw_lock = _RWLock()
 
     # ------------------------------------------------------------------
     # Context helpers
@@ -400,17 +466,19 @@ class IdalibSupervisor:
         }
 
     def bind_context(self, context_id: str, session_id: str) -> None:
-        # Acquired even though dict[]= is atomic in CPython: callers
-        # like release_session() decide whether to terminate a worker
-        # based on a snapshot of context_bindings under self._lock, and
-        # an unlocked write here could slip in between their read and
-        # their decision.  RLock makes calls from already-locked code
-        # (open_session, _finalise_pending) safe.
-        with self._lock:
+        """Public binding mutation. Takes write lock since it modifies
+        a global state dict. Internal callers that already hold the
+        write lock should mutate ``self.context_bindings`` directly
+        rather than recursing through this method (the RW lock is not
+        reentrant).
+        """
+        with self._rw_lock.write():
             self.context_bindings[context_id] = session_id
 
     def unbind_context(self, context_id: str) -> bool:
-        with self._lock:
+        """Public binding mutation. Takes write lock. See note on
+        :meth:`bind_context`."""
+        with self._rw_lock.write():
             return self.context_bindings.pop(context_id, None) is not None
 
     # ------------------------------------------------------------------
@@ -489,7 +557,7 @@ class IdalibSupervisor:
             proc.wait(timeout=5)
 
     def shutdown(self) -> None:
-        with self._lock:
+        with self._rw_lock.write():
             workers = list(self.sessions.values())
             if self._schema_worker is not None:
                 workers.append(self._schema_worker)
@@ -501,7 +569,7 @@ class IdalibSupervisor:
             self._terminate_worker(worker)
 
     def _schema_or_idle_worker(self) -> WorkerSession:
-        with self._lock:
+        with self._rw_lock.write():
             for worker in self.sessions.values():
                 if worker.backend == "worker" and worker.is_alive():
                     return worker
@@ -657,11 +725,14 @@ class IdalibSupervisor:
         return matches[0] if matches else None
 
     def _register_session_locked(self, session: WorkerSession, resolved_path: str, context_id: str | None) -> None:
+        # Caller MUST already hold self._rw_lock.write(). Direct dict
+        # mutation here (instead of self.bind_context) avoids a
+        # recursive write-lock acquire that would deadlock.
         self.sessions[session.session_id] = session
         for candidate in self._candidate_idb_paths(resolved_path):
             self.path_to_session[candidate] = session.session_id
         if context_id is not None:
-            self.bind_context(context_id, session.session_id)
+            self.context_bindings[context_id] = session.session_id
 
     def _unregister_session_locked(self, session_id: str) -> WorkerSession | None:
         session = self.sessions.pop(session_id, None)
@@ -730,7 +801,7 @@ class IdalibSupervisor:
         path_key = self._path_key(resolved)
         requested_session_id = session_id
 
-        with self._lock:
+        with self._rw_lock.write():
             # 1. Live session for this path → reuse. The bind here is
             # a single dict mutation already protected by state lock;
             # no need to take session.lock (we don't touch the worker
@@ -747,7 +818,10 @@ class IdalibSupervisor:
                         )
                     session.last_accessed = datetime.now()
                     if context_id is not None:
-                        self.bind_context(context_id, existing_sid)
+                        # Direct dict mutation — caller already holds
+                        # write lock; do not recurse through
+                        # self.bind_context.
+                        self.context_bindings[context_id] = existing_sid
                     return session
                 # Stale — drop it before starting fresh.
                 self._unregister_session_locked(existing_sid)
@@ -796,7 +870,7 @@ class IdalibSupervisor:
         # tool calls can keep working.
         pending.ready_event.wait(timeout=wait_timeout)
 
-        with self._lock:
+        with self._rw_lock.write():
             # Error wins over a possibly-coalesced session in
             # self.sessions[pending.session_id] — when the spawn ran
             # into a session_id collision the existing session under
@@ -806,11 +880,10 @@ class IdalibSupervisor:
                 raise pending.error
             session = self.sessions.get(pending.session_id)
             if session is not None and session.is_alive():
-                # Late-arrival bind is just a state-dict mutation;
-                # state lock is enough (same reasoning as the live-
-                # session path above).
+                # Late-arrival bind — direct dict mutation while we
+                # still hold the write lock.
                 if context_id and self.context_bindings.get(context_id) != session.session_id:
-                    self.bind_context(context_id, session.session_id)
+                    self.context_bindings[context_id] = session.session_id
                 session.last_accessed = datetime.now()
                 return session
             return pending.to_status_dict()
@@ -833,7 +906,7 @@ class IdalibSupervisor:
                 self._finalise_pending(pending, session)
                 return
 
-            with self._lock:
+            with self._rw_lock.write():
                 worker = self._allocate_worker_locked()
 
             try:
@@ -871,7 +944,7 @@ class IdalibSupervisor:
             logger.warning(
                 "Background open for %s failed: %s", pending.resolved_path, e
             )
-            with self._lock:
+            with self._rw_lock.write():
                 if self._pending.get(path_key) is pending:
                     self._pending.pop(path_key)
                 pending.error = e if isinstance(e, Exception) else RuntimeError(str(e))
@@ -895,7 +968,7 @@ class IdalibSupervisor:
         """
         path_key = self._path_key(pending.resolved_path)
         discard: tuple[WorkerSession, str] | None = None
-        with self._lock:
+        with self._rw_lock.write():
             if self._pending.get(path_key) is pending:
                 self._pending.pop(path_key)
 
@@ -921,7 +994,8 @@ class IdalibSupervisor:
                 pending.session_id = existing_by_path_session.session_id
                 existing_by_path_session.last_accessed = datetime.now()
                 for ctx in pending.contexts_waiting:
-                    self.bind_context(ctx, existing_by_path_session.session_id)
+                    # Caller (finalise) already holds write lock.
+                    self.context_bindings[ctx] = existing_by_path_session.session_id
                 if (
                     pending.requested_session_id is not None
                     and pending.requested_session_id != existing_by_path_session.session_id
@@ -940,7 +1014,7 @@ class IdalibSupervisor:
             else:
                 self._register_session_locked(session, pending.resolved_path, None)
                 for ctx in pending.contexts_waiting:
-                    self.bind_context(ctx, session.session_id)
+                    self.context_bindings[ctx] = session.session_id
 
         if discard is not None:
             self._discard_opened_worker_session(discard[0], discard[1])
@@ -948,7 +1022,7 @@ class IdalibSupervisor:
 
     def list_pending(self, context_id: str) -> list[IdalibPendingInfo]:
         """Return in-flight opens that *context_id* has requested."""
-        with self._lock:
+        with self._rw_lock.read():
             return [
                 pending.to_status_dict()
                 for pending in self._pending.values()
@@ -962,7 +1036,7 @@ class IdalibSupervisor:
         close (the management tool) goes through release_session() so
         other agents holding the binary don't lose their session.
         """
-        with self._lock:
+        with self._rw_lock.write():
             session = self._unregister_session_locked(session_id)
             if session is None:
                 return False
@@ -984,102 +1058,59 @@ class IdalibSupervisor:
     ) -> dict[str, Any]:
         """Drop *context_id*'s binding to *session_id*, refcounted.
 
-        Flow uses the state→session hand-off pattern to avoid any
-        window where the session reference could go stale between
-        lookup and lock acquisition:
+        Writer flow per the RW-lock architecture:
 
-        1. Acquire state lock, look up the session, acquire
-           session.lock WHILE STILL HOLDING state, release state.
-           The session.lock is now held atomically w.r.t. the lookup.
-        2. Save the IDB under session.lock only (no state held).
-        3. Release session.lock, then acquire state lock alone for
-           pop + count + maybe-unregister (atomic).
-        4. Terminate the worker without holding any lock.
+            with self._rw_lock.write():            # exclusive
+                session = sessions.get(sid)
+                with session.lock:                 # binary lock
+                    save                           # HTTP
+                    ref -= 1
+                    if ref == 0:
+                        unregister + terminate
+                # release binary lock
+            # release write lock
 
-        Why the hand-off (state→session→release state) instead of
-        "state, release, session": the gap between releasing state
-        and acquiring session.lock would otherwise let another close
-        terminate the worker, leaving us holding session.lock on a
-        ghost session. Hand-off closes that window.
+        Write lock held throughout, including the terminate, so no
+        reader can start a new tool call or new open on this binary
+        while the worker is being killed (closes Race C). Same-
+        binary concurrent closes serialise on the write lock; cross-
+        binary closes also serialise (single global write lock) —
+        the cost we accept for full Race-C closure.
 
-        Why session.lock is released BEFORE the pop+count step: if
-        we kept session.lock through the pop, a concurrent same-
-        session close would queue behind us — that's fine — but it
-        would ALSO be queueing behind us while holding state (its
-        own hand-off acquire was waiting on our session.lock). That
-        starves every other state operation. By releasing session.lock
-        before retaking state, we let other concurrent closes proceed
-        on their own timeline; the pop+count itself is atomic under
-        state lock so a concurrent open's mid-save binding still gets
-        counted.
-
-        Lock invariants:
-        * The ONLY acquisition order is state → session. Reversing it
-          (session → state) is forbidden.
-        * session.lock is released BEFORE any retake of state, so
-          there is no nested holding.
+        No rebind race recheck is needed: with the write lock
+        exclusive against switch / open / unbind, ``context_bindings``
+        can't change underneath us between the had_binding check and
+        the pop.
         """
-        # Step 1: atomic dict read for the session ref. No state
-        # lock — single dict.get() is atomic in CPython, and we
-        # immediately follow with session.lock.acquire which is
-        # synchronised against close+terminate.
-        session = self.sessions.get(session_id)
-        if session is None:
-            return {
-                "success": False,
-                "released": False,
-                "terminated": False,
-                "error": f"Session not found: {session_id}",
-            }
+        with self._rw_lock.write():
+            session = self.sessions.get(session_id)
+            if session is None:
+                return {
+                    "success": False,
+                    "released": False,
+                    "terminated": False,
+                    "error": f"Session not found: {session_id}",
+                }
 
-        # Step 2: acquire session.lock with no other lock held. Same-
-        # session concurrent closes serialise here without holding
-        # state lock — unrelated state ops can proceed.
-        session.lock.acquire()
-        try:
-            # Step 3: nested state for re-verify + had_binding check.
-            # If another close fully terminated this session in the
-            # window between step 1 and step 2, bail out cleanly.
-            with self._lock:
-                if self.sessions.get(session_id) is not session:
-                    return {
-                        "success": False,
-                        "released": False,
-                        "terminated": False,
-                        "error": (
-                            f"Session {session_id} was torn down before "
-                            "we could acquire its lock."
-                        ),
-                    }
+            with session.lock:
                 had_binding = self.context_bindings.get(context_id) == session_id
 
-            # Step 4: save under session.lock only (no state held).
-            # State-only ops (open's bind, list, switch, ...) can run
-            # concurrently with our save.
-            saved, save_error = (False, None)
-            if had_binding:
-                saved, save_error = self._save_session_idb(session)
+                # Save first — persists this agent's edits to disk
+                # before any decision about teardown.
+                saved, save_error = (False, None)
+                if had_binding:
+                    saved, save_error = self._save_session_idb(session)
 
-            # Step 5: nested state for pop + count + maybe
-            # unregister + terminate. Held continuously so no open
-            # can spawn a new worker for the same path while the old
-            # one is still being killed (closes Race C). Recheck
-            # still_bound to catch the rebind race where a
-            # concurrent open / idalib_switch redirected our
-            # context_id to a different session during the save.
-            with self._lock:
-                still_bound = self.context_bindings.get(context_id) == session_id
-                if still_bound:
+                # Refcount: pop our binding, count what's left.
+                if had_binding:
                     self.context_bindings.pop(context_id, None)
                 remaining = sum(
                     1 for b in self.context_bindings.values() if b == session_id
                 )
-                if still_bound and remaining == 0:
+
+                terminated = False
+                if had_binding and remaining == 0:
                     popped = self._unregister_session_locked(session_id)
-                    # Terminate while state lock is still held — open
-                    # for the same path waits at its own state.acquire
-                    # until we're done, so no transient two-worker
-                    # overlap on the same .i64.
                     if popped is not None and popped.backend == "worker":
                         try:
                             self.call_worker_tool(
@@ -1095,22 +1126,16 @@ class IdalibSupervisor:
                             )
                     if popped is not None:
                         self._terminate_worker(popped)
-                    terminated = popped is not None
-                else:
-                    popped = None
-                    terminated = False
-            # state released
-        finally:
-            session.lock.release()
+                        terminated = True
 
-        return {
-            "success": True,
-            "released": still_bound,
-            "terminated": terminated,
-            "remaining_refs": remaining,
-            "saved": saved,
-            "save_error": save_error,
-        }
+            return {
+                "success": True,
+                "released": had_binding,
+                "terminated": terminated,
+                "remaining_refs": remaining,
+                "saved": saved,
+                "save_error": save_error,
+            }
 
     def _save_session_idb(self, session: WorkerSession) -> tuple[bool, str | None]:
         """Persist *session*'s IDB to disk via the worker. Returns (ok, err)."""
@@ -1155,7 +1180,7 @@ class IdalibSupervisor:
             session.session_id,
         )
         resolved = self._resolve_gui_fallback_path(session)
-        with self._lock:
+        with self._rw_lock.write():
             worker = self._allocate_worker_locked()
         try:
             opened = self.call_worker_tool(
@@ -1187,7 +1212,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
         )
-        with self._lock:
+        with self._rw_lock.write():
             current = self.sessions.get(session.session_id)
             if current is session:
                 self._register_session_locked(replacement, resolved, None)
@@ -1212,69 +1237,56 @@ class IdalibSupervisor:
         raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
 
     @contextmanager
-    def session_scope(
-        self,
-        database: str | None = None,
-        *,
-        bind: str | None = None,
-    ):
-        """Resolve a session and hold its lock for the body of the
-        ``with`` block. Pure session→state ordering:
+    def session_scope(self, database: str | None = None):
+        """Reader-pattern session scope. Used by non-open/close tools.
 
-            with self._lock:
-                session = resolve(database)           # state lock — compound resolve
-            # state released
-            session.lock.acquire()                    # no state held
-            with self._lock:                          # nested state for verify+bind
-                if sessions[sid] is not session: raise stale
-                if bind is not None: context_bindings[bind] = sid
-            # state released
-            yield session
-            session.lock.release()
+        Flow:
+            with self._rw_lock.read():
+                session = resolve(database)           # under read lock
+                session.lock.acquire()                # binary lock for serialise-on-same-binary
+                try:
+                    yield session                    # body does its work
+                finally:
+                    session.lock.release()
+            # read lock released
 
-        Yields the session; releases ``session.lock`` on exit. Callers
-        MAY safely acquire ``self._lock`` inside the body since the
-        only acquisition direction in the codebase is now
-        session→state (never reverse) — so nested state acquisitions
-        are deadlock-free.
+        Held throughout the body — including HTTP forwards — so
+        writers (open/close/switch/unbind) wait for all in-flight
+        tools to finish before proceeding. That serialisation is the
+        point of the readers-writer design: structural changes
+        (open/close) are exclusive against all tool work, but tool
+        work runs in parallel across binaries.
 
-        Small window between releasing state lock and acquiring
-        session.lock is handled by the nested state lock's re-verify
-        (``sessions.get(sid) is session``) — if a concurrent close
-        terminated the session in that window, we raise instead of
-        operating on a ghost.
-
-        GUI sessions whose worker is dead get reopened outside any
-        lock and the replacement session is yielded.
+        For GUI-backed sessions whose worker is dead this calls
+        ``_reopen_gui_session_headless``, which itself takes a write
+        lock for its internal state mutations. We release the outer
+        read lock first to avoid the read→write upgrade trap (which
+        deadlocks against any other writer), reopen, then re-enter
+        the read scope with the replacement session.
         """
-        # Step 1: resolve under state lock (resolve_session_locked
-        # walks several dicts; we need atomic-compound for that).
-        with self._lock:
+        # Phase 1: under read lock, resolve and grab binary lock.
+        # Hold both for the body.
+        with self._rw_lock.read():
             session = self._resolve_session_locked(database)
             session.last_accessed = datetime.now()
-        # state released
+            if session.backend != "gui" or session.is_alive():
+                session.lock.acquire()
+                try:
+                    yield session
+                    return
+                finally:
+                    session.lock.release()
 
-        if session.backend == "gui" and not session.is_alive():
-            # GUI fallback: reopen outside any lock first.
-            session = self._reopen_gui_session_headless(session)
-
-        # Step 2: acquire session.lock with no state held.
-        session.lock.acquire()
-        try:
-            # Step 3: nested state for stale-check + optional bind.
-            with self._lock:
-                current = self.sessions.get(session.session_id)
-                if current is not session:
-                    raise RuntimeError(
-                        f"Session '{session.session_id}' was torn down "
-                        f"before its lock could be acquired."
-                    )
-                if bind is not None:
-                    self.context_bindings[bind] = session.session_id
-            # state released
-            yield session
-        finally:
-            session.lock.release()
+        # GUI fallback: read lock released above (we fell out of the
+        # ``with`` block via ``return``-or-not). Re-acquire after the
+        # reopen.
+        replacement = self._reopen_gui_session_headless(session)
+        with self._rw_lock.read():
+            replacement.lock.acquire()
+            try:
+                yield replacement
+            finally:
+                replacement.lock.release()
 
     def _resolve_session_locked(self, database: str | None) -> WorkerSession:
         """Internal resolve, callable only while ``self._lock`` is held."""
@@ -1342,7 +1354,7 @@ class IdalibSupervisor:
         :meth:`session_scope` so the state→session hand-off closes the
         lookup-vs-tear-down window.
         """
-        with self._lock:
+        with self._rw_lock.read():
             session = self._resolve_session_locked(database)
             session.last_accessed = datetime.now()
         if session.is_alive():
@@ -1354,7 +1366,7 @@ class IdalibSupervisor:
         )
 
     def list_sessions(self, context_id: str) -> list[IdalibSessionListInfo]:
-        with self._lock:
+        with self._rw_lock.read():
             current = self.context_bindings.get(context_id)
             binding_counts: dict[str, int] = {}
             for bound in self.context_bindings.values():
@@ -1373,7 +1385,7 @@ class IdalibSupervisor:
 
     def worker_tools(self) -> list[dict]:
         cache_key = tuple(sorted(getattr(self.mcp._enabled_extensions, "data", set())))
-        with self._lock:
+        with self._rw_lock.write():
             cached = self._tools_cache.get(cache_key)
             if cached is not None:
                 return copy.deepcopy(cached)
@@ -1383,7 +1395,7 @@ class IdalibSupervisor:
         hidden_tools = IDALIB_MANAGEMENT_TOOLS | IDALIB_HIDDEN_PLUGIN_TOOLS
         filtered = [t for t in tools if t.get("name") not in hidden_tools]
         injected = [self._inject_database_arg(t) for t in filtered]
-        with self._lock:
+        with self._rw_lock.write():
             self._tools_cache[cache_key] = injected
         return copy.deepcopy(injected)
 
@@ -1399,7 +1411,7 @@ class IdalibSupervisor:
         return tool
 
     def worker_resources(self, method: str) -> list[dict]:
-        with self._lock:
+        with self._rw_lock.write():
             cached = self._resources_cache.get(method)
             if cached is not None:
                 return copy.deepcopy(cached)
@@ -1407,7 +1419,7 @@ class IdalibSupervisor:
         response = self._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": method})
         key = "resources" if method == "resources/list" else "resourceTemplates"
         items = response.get("result", {}).get(key, [])
-        with self._lock:
+        with self._rw_lock.write():
             self._resources_cache[method] = items
         return copy.deepcopy(items)
 
@@ -1564,17 +1576,20 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        # Hand-off: bind happens atomically with the resolve under the
-        # state lock; session.lock is then held for the (empty) body
-        # so a concurrent close can't terminate the session between
-        # the bind and our return.
-        with sup.session_scope(session_id, bind=context_id) as session:
-            return {
-                "success": True,
-                **sup.context_fields(context_id),
-                "session": session.to_dict(),
-                "message": f"Bound context to session: {session.session_id} ({session.filename})",
-            }
+        # Writer: switch mutates context_bindings — a structural
+        # change, takes the write lock. Pointer reset only; no IDB
+        # I/O, no worker contact, all microseconds inside the lock.
+        with sup._rw_lock.write():
+            session = sup._resolve_session_locked(session_id)
+            sup.context_bindings[context_id] = session.session_id
+            session.last_accessed = datetime.now()
+            payload = session.to_dict()
+        return {
+            "success": True,
+            **sup.context_fields(context_id),
+            "session": payload,
+            "message": f"Bound context to session: {session.session_id} ({session.filename})",
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1585,6 +1600,9 @@ def idalib_unbind() -> IdalibUnbindResult:
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
+        # Writer: pop context_bindings entry. Microseconds inside
+        # the write lock; matches the user-spec for "switch and
+        # unbind both take the write lock".
         if sup.unbind_context(context_id):
             return {
                 "success": True,
@@ -1640,15 +1658,18 @@ def idalib_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
     session_id: Annotated[Optional[str], "Optional session to save"] = None,
 ) -> IdalibSaveResult:
-    """Save the selected database worker's IDB."""
+    """Save the selected database worker's IDB.
+
+    Reader tool under the RW-lock architecture: looks up the session
+    under the read lock, then forwards an HTTP save. Does NOT rebind
+    the calling context to ``session_id`` — that's a structural change
+    and belongs in ``idalib_switch``; call switch separately if you
+    want to change the current context's bound session.
+    """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        # Bind in the hand-off so we never re-acquire state under
-        # session.lock (which would deadlock against release_session's
-        # state→session order).
-        bind = context_id if session_id else None
-        with sup.session_scope(session_id, bind=bind) as session:
+        with sup.session_scope(session_id) as session:
             tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
             result = sup.call_worker_tool(session, tool_name, {"path": path})
             if isinstance(result, dict):
@@ -1666,8 +1687,7 @@ def idalib_health(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        bind = context_id if session_id else None
-        with sup.session_scope(session_id, bind=bind) as session:
+        with sup.session_scope(session_id) as session:
             if session.backend == "gui":
                 health = sup.call_worker_tool(session, "server_health", {})
                 return {
@@ -1696,8 +1716,7 @@ def idalib_warmup(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        bind = context_id if session_id else None
-        with sup.session_scope(session_id, bind=bind) as session:
+        with sup.session_scope(session_id) as session:
             if session.backend == "gui":
                 warmup = sup.call_worker_tool(
                     session,
