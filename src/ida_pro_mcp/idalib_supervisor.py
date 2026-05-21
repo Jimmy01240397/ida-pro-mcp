@@ -978,6 +978,31 @@ class IdalibSupervisor:
           the IDB so this agent's edits persist, return
           ``{"success": True, "released": True, "terminated": False,
           "remaining_refs": <int>, "saved": <bool>}``.
+
+        Locking note: the bookkeeping pop, the save, and the
+        terminate-or-not decision all run under ``self._lock``. The
+        save itself is an HTTP round-trip to the worker, so the
+        critical section is "slow" (tens of ms typical) — but a
+        ``release_session`` call is rare relative to tool dispatches,
+        and holding the lock through the save is what eliminates two
+        classes of race that an earlier "save outside the lock"
+        version couldn't avoid:
+
+        1. A concurrent ``release_session`` for the same session
+           reaches step 1 while we're saving, decides ``is_last=False``
+           wrongly because it sees a different snapshot of
+           ``context_bindings`` than ours;
+        2. A concurrent ``open_session`` for the same path binds a
+           fresh context during our save, then we terminate the worker
+           it just attached to.
+
+        Both go away if save runs while the lock is held, because no
+        other thread can mutate ``context_bindings`` or
+        ``path_to_session`` mid-save. Worker-level concurrent saves
+        are still possible across DIFFERENT sessions (different
+        WorkerSessions, different lock holders if the supervisor ever
+        sharded its lock per-session) — but a single session's
+        save↔terminate pair is now atomic.
         """
         with self._lock:
             session = self.sessions.get(session_id)
@@ -996,36 +1021,23 @@ class IdalibSupervisor:
             remaining = len(bound)
             is_last = had_binding and remaining == 0
 
-        # Save before deciding whether to terminate so this agent's
-        # edits hit disk regardless of whether other agents keep the
-        # worker alive.
-        saved, save_error = self._save_session_idb(session) if had_binding else (False, None)
+            # Save under the lock so the save and the
+            # terminate-or-not decision are atomic w.r.t. concurrent
+            # close / open.
+            saved, save_error = (
+                self._save_session_idb(session) if had_binding else (False, None)
+            )
 
-        if not is_last:
-            return {
-                "success": True,
-                "released": had_binding,
-                "terminated": False,
-                "remaining_refs": remaining,
-                "saved": saved,
-                "save_error": save_error,
-            }
-
-        # Final ref — try to fully unregister + terminate. But if a
-        # concurrent open_session() re-bound to this session during our
-        # save (it would see the path_to_session entry still pointing
-        # here), leave the worker alive so that new binding survives.
-        with self._lock:
-            late_refs = self._bound_context_ids_locked(session_id)
-            if late_refs:
+            if not is_last:
                 return {
                     "success": True,
-                    "released": True,
+                    "released": had_binding,
                     "terminated": False,
-                    "remaining_refs": len(late_refs),
+                    "remaining_refs": remaining,
                     "saved": saved,
                     "save_error": save_error,
                 }
+
             popped = self._unregister_session_locked(session_id)
         if popped is None:
             popped = session  # shouldn't happen, but be defensive

@@ -793,9 +793,19 @@ def test_concurrent_release_from_two_agents_terminates_exactly_once(tmp_path):
     assert sup.context_bindings == {}
 
 
-def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
-    """Race: A is the last holder and starts save; B opens during the save
-    and adds a ref. A's post-save recheck must SKIP the terminate.
+def test_release_session_concurrent_open_serializes_through_lock(tmp_path):
+    """Save under self._lock makes close atomic w.r.t. concurrent
+    open_session. An open that arrives during a final-ref close waits
+    on self._lock; by the time it runs, the session is gone and the
+    open spawns a brand-new worker.
+
+    The previous design released self._lock during save so the open
+    could sneak in and add a ref that the post-save recheck would
+    catch. That worked but the save sat outside the lock — meaning a
+    concurrent close-vs-save / save-vs-terminate race could happen at
+    the worker level. We trade that race for a slightly more wasteful
+    "concurrent open spawns a fresh worker" outcome; no data is lost
+    because the close DID save before tearing down.
     """
     import threading as _threading
 
@@ -803,6 +813,7 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     sample.write_bytes(b"x")
     sup = _make_saving_sup()
     sup.open_session(str(sample), session_id="solo", context_id="ctxA")
+    pre_close_process = sup.sessions["solo"].process
 
     save_started = _threading.Event()
     save_can_finish = _threading.Event()
@@ -821,21 +832,50 @@ def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     def do_release():
         result_holder["r"] = sup.release_session("solo", "ctxA")
 
-    t = _threading.Thread(target=do_release)
-    t.start()
+    t_close = _threading.Thread(target=do_release)
+    t_close.start()
     assert save_started.wait(timeout=2.0)
 
-    # While ctxA's save is in flight, ctxB joins the (still alive) session.
-    sup.open_session(str(sample), session_id="solo", context_id="ctxB")
+    # ctxB tries to open the same path while ctxA's close is mid-save.
+    # The open will block on self._lock until close completes.
+    open_done = _threading.Event()
+    open_result: list = []
 
+    def do_open():
+        try:
+            open_result.append(
+                sup.open_session(str(sample), session_id="solo", context_id="ctxB")
+            )
+        finally:
+            open_done.set()
+
+    t_open = _threading.Thread(target=do_open)
+    t_open.start()
+    # Give the open a moment to reach the self._lock acquire.
+    import time as _time
+    _time.sleep(0.1)
+    assert not open_done.is_set(), "open should be blocked on self._lock during close"
+
+    # Let the close finish.
     save_can_finish.set()
-    t.join(timeout=3.0)
-    assert not t.is_alive()
+    t_close.join(timeout=3.0)
+    t_open.join(timeout=3.0)
+    assert not t_close.is_alive()
+    assert not t_open.is_alive()
+
     outcome = result_holder["r"]
+    # Close ran atomically: is_last=True, saved, terminated.
     assert outcome["released"] is True
-    assert outcome["terminated"] is False  # B's ref kept it alive
-    assert outcome["remaining_refs"] == 1
-    assert "solo" in sup.sessions
+    assert outcome["terminated"] is True
+    assert outcome["saved"] is True
+    # B's open ran AFTER close, saw no session, spawned fresh.
+    assert open_result, "open did not complete"
+    new_session = open_result[0]
+    assert new_session.session_id == "solo"
+    assert new_session.process is not pre_close_process, (
+        "expected a fresh worker process, got the same one back"
+    )
+    assert sup.sessions["solo"] is new_session
     assert sup.context_bindings == {"ctxB": "solo"}
 
 
