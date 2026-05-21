@@ -1,3 +1,4 @@
+import hashlib
 import re
 import select
 import socket
@@ -63,6 +64,19 @@ class _McpSseConnection:
         except (BrokenPipeError, OSError):
             self.alive = False
             return False
+
+
+def _agent_id_from_auth_header(auth_header: str | None) -> str:
+    """Hash the Bearer token to a short stable agent id, or "anonymous"."""
+    if not auth_header:
+        return "anonymous"
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return "anonymous"
+    token = parts[1].strip()
+    if not token:
+        return "anonymous"
+    return "agent_" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
 def _origin_allowed_by_policy(
@@ -335,6 +349,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)
         setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
+        setattr(
+            self.mcp_server._agent_id,
+            "data",
+            _agent_id_from_auth_header(self.headers.get("Authorization")),
+        )
 
         try:
             # Dispatch to MCP registry
@@ -344,6 +363,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             setattr(self.mcp_server._enabled_extensions, "data", set())
             setattr(self.mcp_server._protocol_version, "data", None)
             setattr(self.mcp_server._transport_session_id, "data", None)
+            setattr(self.mcp_server._agent_id, "data", "anonymous")
 
         # Send SSE response if necessary
         if response is not None:
@@ -397,6 +417,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             "data",
             f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
         )
+        setattr(
+            self.mcp_server._agent_id,
+            "data",
+            _agent_id_from_auth_header(self.headers.get("Authorization")),
+        )
 
         # Dispatch to MCP registry
         setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
@@ -406,6 +431,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             setattr(self.mcp_server._enabled_extensions, "data", set())
             setattr(self.mcp_server._protocol_version, "data", None)
             setattr(self.mcp_server._transport_session_id, "data", None)
+            setattr(self.mcp_server._agent_id, "data", "anonymous")
 
         def send_response(status: int, body: bytes):
             self.send_response(status)
@@ -442,6 +468,7 @@ class McpServer:
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
         self._enabled_extensions = threading.local()  # set[str] per request
+        self._agent_id = threading.local()  # str per request (hashed Bearer token)
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
 
@@ -589,6 +616,16 @@ class McpServer:
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
+
+    def get_current_agent_id(self) -> str:
+        """Return the hashed Bearer token identifying the calling agent.
+
+        Returns ``"anonymous"`` when no ``Authorization: Bearer …`` header
+        was provided so existing clients keep working without changes.
+        Multiple clients sharing the same token share the same agent
+        view; clients with distinct tokens are isolated from each other.
+        """
+        return getattr(self._agent_id, "data", "anonymous") or "anonymous"
 
     def register_http_session(self, session_id: str) -> None:
         with self._http_sessions_lock:

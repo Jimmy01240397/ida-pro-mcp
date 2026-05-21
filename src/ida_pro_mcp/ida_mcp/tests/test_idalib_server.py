@@ -22,7 +22,7 @@ def test_idalib_list_returns_empty_when_no_sessions():
     original_get_session_manager = idalib_server.get_session_manager
 
     class _FakeManager:
-        def list_sessions(self):
+        def list_sessions(self, agent_id):
             return []
 
     idalib_server.get_session_manager = lambda: _FakeManager()

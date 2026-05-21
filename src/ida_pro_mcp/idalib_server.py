@@ -26,7 +26,7 @@ import idapro
 
 from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
-from ida_pro_mcp.ida_mcp.rpc import tool
+from ida_pro_mcp.ida_mcp.rpc import get_current_agent_id, tool
 from ida_pro_mcp.idalib_session_manager import (
     _DEFAULT_SPAWN_TIMEOUT,
     get_session_manager,
@@ -68,6 +68,10 @@ class IdalibOpenResult(TypedDict, total=False):
 
 class IdalibCloseResult(TypedDict, total=False):
     success: bool
+    saved: bool
+    save_error: Optional[str]
+    terminated: bool
+    remaining_refs: int
     message: str
     error: str
 
@@ -116,11 +120,19 @@ _SESSION_ID_SCHEMA = {
 # Proxy helper
 # -----------------------------------------------------------------------
 
-def _proxy_to_worker(session_id: str, method: str, params: dict) -> dict:
+def _proxy_to_worker(
+    agent_id: str, session_id: str, method: str, params: dict
+) -> dict:
     """Send a JSON-RPC request to a worker via stdio and return the
-    MCP result envelope (e.g. ``{content, structuredContent, isError}``)."""
+    MCP result envelope (e.g. ``{content, structuredContent, isError}``).
+
+    The ``(agent_id, session_id)`` pair is validated by the session
+    manager — sessions belonging to another agent are rejected so an
+    agent cannot drive a binary that another agent opened just by
+    guessing its short ID.
+    """
     manager = get_session_manager()
-    response = manager.proxy_jsonrpc(session_id, method, params)
+    response = manager.proxy_jsonrpc(agent_id, session_id, method, params)
     if "error" in response:
         err = response["error"]
         return {
@@ -168,9 +180,10 @@ def _install_session_hooks() -> None:
                 "isError": True,
             }
 
+        agent_id = get_current_agent_id()
         try:
             return _proxy_to_worker(
-                session_id, "tools/call",
+                agent_id, session_id, "tools/call",
                 {"name": name, "arguments": arguments},
             )
         except Exception as e:
@@ -210,9 +223,10 @@ def _install_session_hooks() -> None:
         qs = parse_qs(parsed.query)
         session_id = qs.pop("session", [None])[0]
 
+        agent_id = get_current_agent_id()
         if not session_id:
             manager = get_session_manager()
-            sessions = manager.list_sessions()
+            sessions = manager.list_sessions(agent_id)
             if len(sessions) == 1:
                 session_id = sessions[0]["session_id"]
             else:
@@ -240,7 +254,7 @@ def _install_session_hooks() -> None:
 
         try:
             return _proxy_to_worker(
-                session_id, "resources/read", {"uri": clean_uri}
+                agent_id, session_id, "resources/read", {"uri": clean_uri}
             )
         except Exception as e:
             return {
@@ -270,16 +284,22 @@ def idalib_open(
         float, "Seconds to wait for the worker to become ready before returning a pending status"
     ] = 10.0,
 ) -> IdalibOpenResult:
-    """Open a binary in a new worker process.
+    """Open a binary for the calling agent.
 
-    Returns ``{status: 'ready', session: ...}`` once the worker is live,
-    or ``{status: 'opening', pending: ...}`` if it didn't become ready
+    The worker is shared between agents: opening a binary that another
+    agent already opened reuses the existing IDA process and returns a
+    new ``session_id`` scoped to this agent.  Returns
+    ``{status: 'ready', session: ...}`` once the worker is live, or
+    ``{status: 'opening', pending: ...}`` if it didn't become ready
     within ``wait_timeout`` (the worker keeps loading in the background;
     call this tool again to wait for it).
     """
     try:
         manager = get_session_manager()
-        result = manager.open_binary(Path(input_path), wait_timeout=wait_timeout)
+        agent_id = get_current_agent_id()
+        result = manager.open_binary(
+            agent_id, Path(input_path), wait_timeout=wait_timeout
+        )
         if result["status"] == "ready":
             session = result["session"]
             return {
@@ -320,22 +340,27 @@ def idalib_open(
 def idalib_close(
     session_id: Annotated[str, "Session ID to close"],
 ) -> IdalibCloseResult:
-    """Close an idalib session (terminates the worker process)."""
+    """Close an idalib session for the calling agent.
+
+    Saves the database first.  If other agents still hold the binary
+    open, the worker stays alive and only this agent's session is
+    dropped; otherwise the worker is terminated.
+    """
     try:
         manager = get_session_manager()
-        if manager.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
-        return {"success": False, "error": f"Session not found: {session_id}"}
+        agent_id = get_current_agent_id()
+        outcome = manager.close_session(agent_id, session_id)
+        return outcome  # type: ignore[return-value]
     except Exception as e:
         return {"error": f"Failed to close session: {e}"}
 
 
 @tool
 def idalib_list() -> IdalibListResult:
-    """List all open idalib sessions and their worker status."""
+    """List idalib sessions belonging to the calling agent."""
     try:
         manager = get_session_manager()
-        sessions = manager.list_sessions()
+        sessions = manager.list_sessions(get_current_agent_id())
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
@@ -343,15 +368,14 @@ def idalib_list() -> IdalibListResult:
 
 @tool
 def list_open_pending() -> IdalibPendingListResult:
-    """List binaries whose worker is still spawning (not yet in idalib_list).
+    """List binaries the calling agent has requested but that are still spawning.
 
     Each entry carries the same shape as ``idalib_open`` returns under
-    its ``pending`` key — including ``elapsed_seconds`` so callers can
-    decide whether to keep waiting.
+    its ``pending`` key.
     """
     try:
         manager = get_session_manager()
-        raw = manager.list_pending()
+        raw = manager.list_pending(get_current_agent_id())
         pending: list[IdalibPendingInfo] = [
             {
                 "session_id": entry["session_id"],
@@ -418,9 +442,11 @@ def main() -> None:
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
         logger.info("Opening initial binary: %s", args.input_path)
         # Wait the full spawn timeout on startup so the server is ready
-        # to serve right away.
+        # to serve right away.  Owned by the "anonymous" agent so
+        # clients without an Authorization header see it in
+        # idalib_list; clients with a Bearer token open their own.
         result = session_manager.open_binary(
-            args.input_path, wait_timeout=_DEFAULT_SPAWN_TIMEOUT
+            "anonymous", args.input_path, wait_timeout=_DEFAULT_SPAWN_TIMEOUT
         )
         if result["status"] == "ready":
             logger.info("Initial session ready: %s", result["session"]["session_id"])

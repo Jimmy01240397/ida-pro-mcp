@@ -30,6 +30,11 @@ def get_current_transport_session_id() -> str | None:
     return MCP_SERVER.get_current_transport_session_id()
 
 
+def get_current_agent_id() -> str:
+    """Return the hashed Bearer token identifying the calling agent."""
+    return MCP_SERVER.get_current_agent_id()
+
+
 def _generate_output_id() -> str:
     import uuid
 
@@ -182,4 +187,5 @@ __all__ = [
     "set_download_base_url",
     "get_download_base_url",
     "get_current_transport_session_id",
+    "get_current_agent_id",
 ]

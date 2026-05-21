@@ -354,6 +354,27 @@ def server_health() -> ServerHealthResult:
 
 @tool
 @idasync
+def save_database() -> dict:
+    """Persist the current IDA database (.i64) to disk.
+
+    Used by the idalib session manager on close, but also callable
+    directly when an agent wants to checkpoint their work.
+    """
+    try:
+        # idapro lives in the worker process under idalib; under the
+        # regular IDA plugin we fall back to ida_loader.save_database.
+        try:
+            import idapro
+            idapro.save_database()
+        except (ImportError, AttributeError):
+            ida_loader.save_database(idc.get_idb_path(), 0)
+        return {"saved": True, "idb_path": idc.get_idb_path()}
+    except Exception as e:  # noqa: BLE001 — surface to caller
+        return {"saved": False, "error": str(e)}
+
+
+@tool
+@idasync
 def server_warmup(
     wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
     build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,

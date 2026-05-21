@@ -1,23 +1,48 @@
-"""IDALib Session Manager — multi-process worker management via stdio IPC.
+"""IDALib Session Manager — multi-agent, multi-process worker management.
 
-Each binary runs in its own idalib worker subprocess.  Communication uses
-line-delimited JSON-RPC over stdin/stdout pipes (no network ports).  A
-per-worker lock serialises requests so multiple agents can safely share
-the same session manager.
+Workers vs. agent sessions
+--------------------------
 
-Opens are split into two phases:
+Each binary on disk maps to *at most one* worker subprocess
+(``IDAWorker``).  Multiple agents that open the same path are handed
+*distinct* agent-scoped session IDs that all reference that single
+worker.  This means:
 
-* The caller of :meth:`open_binary` blocks for at most ``wait_timeout``
-  seconds.  If the worker becomes ready in that window, ``open_binary``
-  returns ``{"status": "ready", "session": ...}``.
-* Otherwise it returns ``{"status": "opening", ...}``; a background
-  thread keeps reading the worker's stdout until either ``WORKER_READY``
-  arrives (at which point the session is published) or ``spawn_timeout``
-  elapses (at which point the worker is killed and the slot freed).
+* Spawning IDA happens once per binary, no matter how many agents are
+  attached.  The expensive auto-analysis cost is amortised.
+* Each agent sees an isolated session list (``idalib_list`` only
+  returns their own session IDs).  Cross-agent session-ID guessing
+  doesn't help because the manager validates ``(agent_id, session_id)``
+  pairs on every call.
+* Closing a session saves the database (``.i64``) first and then drops
+  this agent's reference.  The worker is terminated only when the last
+  agent releases the binary, so other agents keep working without
+  interruption.
 
-Concurrent ``open_binary`` calls for the same path coalesce onto a
-single worker, so duplicate spawns are impossible even when the HTTP
-server dispatches requests on multiple threads.
+Pending-open semantics from the prior commit still apply: ``open`` may
+return ``{status: "opening", ...}`` after ``wait_timeout``, agents
+calling ``open`` again coalesce onto the same pending entry, and
+``list_sessions`` hides pending workers.
+
+Concurrency model
+-----------------
+
+* ``self._lock`` (``RLock``) protects all in-memory maps:
+  ``_workers``, ``_agent_sessions``, ``_pending``.  All check-then-mutate
+  sequences run under it.
+* Each worker has its own ``io_lock`` serialising stdin/stdout JSON-RPC
+  with the subprocess — multiple agents on the same worker queue up,
+  multiple workers proceed in parallel.
+* ``_finalise_pending`` uses an identity check (``existing is pending``)
+  so a displaced pending (e.g. after ``close_all_sessions``) kills its
+  worker instead of getting promoted into a phantom session.
+* Save-then-decrement on close is split: the save runs under the
+  worker's ``io_lock``, the refcount mutation runs under ``self._lock``,
+  and only when refs become empty does the manager remove the worker.
+  A concurrent ``open`` of the same path during this window simply adds
+  itself to ``worker.refs`` before the close re-acquires the lock, which
+  keeps the worker alive — no leaked workers, no terminated-then-reused
+  workers.
 """
 
 import atexit
@@ -30,7 +55,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -38,36 +63,45 @@ _WORKER_SCRIPT = str(Path(__file__).parent / "idalib_worker.py")
 _READY_SENTINEL = "WORKER_READY"
 _ERROR_SENTINEL = "WORKER_ERROR"
 
-_DEFAULT_WAIT_TIMEOUT = 10.0  # seconds before open_binary returns "opening"
+_DEFAULT_WAIT_TIMEOUT = 10.0  # seconds before open returns "opening"
 _DEFAULT_SPAWN_TIMEOUT = 3600.0  # hard limit on background spawn (1 hour)
+_DEFAULT_SAVE_TIMEOUT = 600.0  # ceiling on the save_database JSON-RPC call
 
 
 @dataclass
-class IDAWorkerSession:
-    """Represents a worker subprocess serving one IDA database."""
+class IDAWorker:
+    """Worker subprocess serving one binary, shared across agents."""
 
-    session_id: str
-    input_path: Path
+    resolved_path: str
     process: subprocess.Popen
-    _lock: threading.Lock = field(default_factory=threading.Lock)
     created_at: datetime = field(default_factory=datetime.now)
-    last_accessed: datetime = field(default_factory=datetime.now)
+    io_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Every (agent_id, agent_session_id) currently holding a reference.
+    refs: set[Tuple[str, str]] = field(default_factory=set)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def alive(self) -> bool:
         return self.process.poll() is None
 
+
+@dataclass
+class AgentSession:
+    """Per-agent view of an open binary."""
+
+    agent_id: str
+    session_id: str  # short, unique within agent_id
+    resolved_path: str
+    created_at: datetime = field(default_factory=datetime.now)
+    last_accessed: datetime = field(default_factory=datetime.now)
+
     def to_dict(self) -> dict:
         return {
             "session_id": self.session_id,
-            "input_path": str(self.input_path),
-            "filename": self.input_path.name,
-            "alive": self.alive,
-            "pid": self.process.pid,
+            "input_path": self.resolved_path,
+            "filename": Path(self.resolved_path).name,
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
-            "metadata": self.metadata,
         }
 
 
@@ -76,20 +110,23 @@ class PendingOpen:
     """A worker subprocess that has been spawned but is not yet ready."""
 
     resolved_path: str
-    session_id: str
     process: subprocess.Popen
     started_at: datetime
     ready_event: threading.Event
-    error: Optional[str] = None  # set when spawn fails; ready_event is also set
+    # agent_id → agent_session_id allocated for that waiter.  When the
+    # worker becomes ready every entry here is materialised into an
+    # AgentSession and the worker.refs set.
+    refs: Dict[str, str] = field(default_factory=dict)
+    error: Optional[str] = None
 
     @property
     def elapsed_seconds(self) -> float:
         return (datetime.now() - self.started_at).total_seconds()
 
-    def to_status_dict(self) -> dict:
+    def status_dict_for_agent(self, session_id: str) -> dict:
         return {
             "status": "opening",
-            "session_id": self.session_id,
+            "session_id": session_id,
             "resolved_path": self.resolved_path,
             "filename": Path(self.resolved_path).name,
             "started_at": self.started_at.isoformat(),
@@ -99,42 +136,38 @@ class PendingOpen:
 
 
 class IDASessionManager:
-    """Manages idalib worker subprocesses communicating via stdio."""
+    """Multi-agent session manager."""
 
     def __init__(self):
-        self._sessions: Dict[str, IDAWorkerSession] = {}
-        # resolved-path → in-flight spawn.  Holding ``_lock`` makes the
-        # check-and-insert atomic, which is what prevents duplicate spawns.
+        self._workers: Dict[str, IDAWorker] = {}  # resolved_path → worker
+        self._agent_sessions: Dict[str, Dict[str, AgentSession]] = {}
         self._pending: Dict[str, PendingOpen] = {}
         self._lock = threading.RLock()
-        logger.info("IDASessionManager initialised")
+        logger.info("IDASessionManager initialised (multi-agent mode)")
 
     # ------------------------------------------------------------------
-    # Public API
+    # Open
     # ------------------------------------------------------------------
 
     def open_binary(
         self,
+        agent_id: str,
         input_path: Path | str,
         wait_timeout: float = _DEFAULT_WAIT_TIMEOUT,
         spawn_timeout: float = _DEFAULT_SPAWN_TIMEOUT,
     ) -> dict:
-        """Open a worker for *input_path* and return its status.
+        """Open *input_path* for *agent_id*.
 
         Returns one of:
 
-        * ``{"status": "ready", "session": <session dict>}`` — worker is
-          live and the session ID is valid for tool calls.
-        * ``{"status": "opening", "session_id": ..., "elapsed_seconds": ..., ...}``
-          — the worker is still being spawned.  The same dict shape can
-          be obtained from subsequent ``open_binary`` calls for the same
-          path; the returned ``session_id`` is *not yet* usable for
-          ``proxy_jsonrpc`` until ``status`` becomes ``"ready"``.
-
-        Raises ``FileNotFoundError`` if the path doesn't exist, and
-        ``RuntimeError`` if the worker spawn failed.  Failed pendings are
-        removed from the in-flight set immediately, so a fresh
-        ``open_binary`` call will start a new spawn.
+        * ``{"status": "ready", "session": <agent session dict>}`` — the
+          worker is live and the returned ``session_id`` is usable for
+          tool calls right away.
+        * ``{"status": "opening", "session_id": ..., ...}`` — the worker
+          is still being spawned.  Subsequent ``open_binary`` calls from
+          the *same* agent for the same path return the same
+          ``session_id``; calls from *other* agents get their own
+          ``session_id`` but share the same underlying spawn.
         """
         input_path = Path(input_path)
         if not input_path.exists():
@@ -143,141 +176,317 @@ class IDASessionManager:
         resolved = str(input_path.resolve())
 
         with self._lock:
-            # Re-use a live session for the same binary.
-            for sid, session in list(self._sessions.items()):
-                if str(session.input_path.resolve()) == resolved:
-                    if session.alive:
-                        session.last_accessed = datetime.now()
-                        return {"status": "ready", "session": session.to_dict()}
-                    # Stale session — drop it and fall through to spawn.
-                    logger.warning("Stale session %s, re-spawning", sid)
-                    self._sessions.pop(sid)
-                    break
+            # Re-use a live worker for the same binary.
+            worker = self._workers.get(resolved)
+            if worker is not None and worker.alive:
+                existing = self._find_agent_session_for_path(agent_id, resolved)
+                if existing is None:
+                    existing = self._mint_agent_session(agent_id, resolved)
+                    worker.refs.add((agent_id, existing.session_id))
+                existing.last_accessed = datetime.now()
+                return {
+                    "status": "ready",
+                    "session": self._session_to_dict(existing, worker),
+                }
 
+            if worker is not None and not worker.alive:
+                logger.warning(
+                    "Stale worker for %s (pid %d), re-spawning",
+                    resolved,
+                    worker.process.pid,
+                )
+                self._drop_worker(worker)
+
+            # Re-use or start a pending spawn.
             pending = self._pending.get(resolved)
             if pending is None:
                 pending = self._begin_spawn(input_path, resolved, spawn_timeout)
+            # Allocate (or re-use) this agent's session id on the pending.
+            if agent_id in pending.refs:
+                agent_session_id = pending.refs[agent_id]
+            else:
+                agent_session_id = self._allocate_session_id(agent_id)
+                pending.refs[agent_id] = agent_session_id
 
-        # Wait OUTSIDE the manager lock so other paths (and concurrent
-        # callers for the same path) aren't blocked.  The pending object
-        # lives until _finalise_pending() decides its fate.
+        # Wait OUTSIDE the manager lock.
         pending.ready_event.wait(timeout=wait_timeout)
 
         with self._lock:
-            session = self._sessions.get(pending.session_id)
+            # Did the worker materialise?
+            session = self._agent_sessions.get(agent_id, {}).get(agent_session_id)
             if session is not None:
-                session.last_accessed = datetime.now()
-                return {"status": "ready", "session": session.to_dict()}
-            if pending.error:
-                # All waiters on this pending see the same error.  The
-                # entry has already been removed from _pending by
-                # _finalise_pending, so a fresh open call will retry.
+                worker = self._workers.get(session.resolved_path)
+                if worker is not None and worker.alive:
+                    session.last_accessed = datetime.now()
+                    return {
+                        "status": "ready",
+                        "session": self._session_to_dict(session, worker),
+                    }
+
+            if pending.error and pending.refs.get(agent_id) == agent_session_id:
                 raise RuntimeError(pending.error)
-            return pending.to_status_dict()
 
-    def close_session(self, session_id: str) -> bool:
-        """Terminate a live session.  Returns ``False`` for unknown IDs.
+            return pending.status_dict_for_agent(agent_session_id)
 
-        Pending sessions (still spawning) are intentionally not affected
-        here — wait for them to finish or fail naturally.
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
+    def close_session(self, agent_id: str, session_id: str) -> dict:
+        """Drop *agent_id*'s reference to *session_id*.
+
+        Saves the database first.  If the agent was the last holder of
+        the underlying worker, terminates it.  Returns a status dict
+        describing what happened.
+        """
+        # Step 1 — atomically remove this agent's view of the session so
+        # a concurrent open(same path) from the same agent doesn't see
+        # the dying session_id.  worker.refs still holds (agent, sid) so
+        # the worker isn't seen as ref-free yet; other agents opening the
+        # binary during our save will simply add another ref and keep it
+        # alive.
+        with self._lock:
+            session = self._agent_sessions.get(agent_id, {}).pop(session_id, None)
+            if session is None:
+                # Maybe the agent is closing a still-pending session?
+                pending = self._find_pending_for_agent_session(agent_id, session_id)
+                if pending is not None:
+                    pending.refs.pop(agent_id, None)
+                    return {
+                        "success": True,
+                        "saved": False,
+                        "terminated": False,
+                        "message": "Cancelled pending open for this agent.",
+                    }
+                return {
+                    "success": False,
+                    "error": f"Session not found for this agent: {session_id}",
+                }
+            resolved = session.resolved_path
+            worker = self._workers.get(resolved)
+
+        if worker is None:
+            return {
+                "success": True,
+                "saved": False,
+                "terminated": False,
+                "message": "Session removed (worker was already gone).",
+            }
+
+        # Step 2 — save outside the global lock so other agents can keep
+        # using the worker (any tool call from them will queue on
+        # worker.io_lock just like our save does).
+        saved, save_error = self._save_database(worker)
+
+        # Step 3 — drop our refcount and decide whether to terminate.
+        # If another agent opened the binary while we were saving,
+        # worker.refs now contains their (agent, sid) and we leave the
+        # worker alive.
+        with self._lock:
+            worker.refs.discard((agent_id, session_id))
+            if worker.refs:
+                return {
+                    "success": True,
+                    "saved": saved,
+                    "save_error": save_error,
+                    "terminated": False,
+                    "remaining_refs": len(worker.refs),
+                    "message": (
+                        f"Session removed; {len(worker.refs)} other agent session(s) "
+                        f"still attached to this binary."
+                    ),
+                }
+            # Last ref — drop the worker from the map under the lock so
+            # any concurrent open sees "no worker" and starts a fresh
+            # spawn instead of attaching to a dying one.
+            self._workers.pop(resolved, None)
+
+        # Step 4 — terminate outside the global lock, holding io_lock so
+        # any concurrent proxy_jsonrpc finishes before we kill the pipe.
+        with worker.io_lock:
+            self._terminate_worker(worker)
+        logger.info("Worker %s terminated (last agent released)", resolved)
+        return {
+            "success": True,
+            "saved": saved,
+            "save_error": save_error,
+            "terminated": True,
+            "message": "Database saved and worker terminated.",
+        }
+
+    # ------------------------------------------------------------------
+    # Listing
+    # ------------------------------------------------------------------
+
+    def list_sessions(self, agent_id: str) -> list[dict]:
+        """Return live sessions visible to *agent_id* only."""
+        with self._lock:
+            sessions = self._agent_sessions.get(agent_id, {}).values()
+            return [
+                self._session_to_dict(s, self._workers.get(s.resolved_path))
+                for s in sessions
+            ]
+
+    @staticmethod
+    def _session_to_dict(
+        session: "AgentSession", worker: Optional["IDAWorker"]
+    ) -> dict:
+        d = session.to_dict()
+        d["alive"] = worker is not None and worker.alive
+        d["pid"] = worker.process.pid if worker is not None else None
+        d["metadata"] = dict(worker.metadata) if worker is not None else {}
+        return d
+
+    def list_pending(self, agent_id: str) -> list[dict]:
+        """Return pending opens this *agent_id* has requested."""
+        with self._lock:
+            out = []
+            for pending in self._pending.values():
+                agent_session_id = pending.refs.get(agent_id)
+                if agent_session_id is None:
+                    continue
+                out.append(pending.status_dict_for_agent(agent_session_id))
+            return out
+
+    # ------------------------------------------------------------------
+    # Tool dispatch
+    # ------------------------------------------------------------------
+
+    def proxy_jsonrpc(
+        self, agent_id: str, session_id: str, method: str, params: dict
+    ) -> dict:
+        """Forward a JSON-RPC call to the worker behind ``(agent_id, session_id)``.
+
+        Other agents' session IDs are rejected — even if guessed — so
+        agent A can't drive a session that belongs to agent B.
         """
         with self._lock:
-            session = self._sessions.pop(session_id, None)
-        if session is None:
-            return False
-        # Wait for any in-flight I/O to finish before terminating.
-        with session._lock:
-            self._terminate_worker(session)
-        logger.info("Session closed: %s", session_id)
-        return True
-
-    def proxy_jsonrpc(self, session_id: str, method: str, params: dict) -> dict:
-        """Send a JSON-RPC request to a worker and return the parsed response."""
-        # Acquire session._lock while still holding self._lock so that
-        # close_session cannot terminate the worker in the gap.
-        with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._agent_sessions.get(agent_id, {}).get(session_id)
             if session is None:
-                # Friendlier error if the caller is using a session_id
-                # that's still being spawned.
-                pending = next(
-                    (p for p in self._pending.values() if p.session_id == session_id),
-                    None,
-                )
+                pending = self._find_pending_for_agent_session(agent_id, session_id)
                 if pending is not None:
                     raise RuntimeError(
                         f"Session {session_id} is still opening "
                         f"(elapsed={pending.elapsed_seconds:.1f}s). "
                         f"Call idalib_open again to wait for it to be ready."
                     )
-                raise ValueError(f"Session not found: {session_id}")
-            if not session.alive:
+                raise ValueError(f"Session not found for this agent: {session_id}")
+            worker = self._workers.get(session.resolved_path)
+            if worker is None or not worker.alive:
                 raise RuntimeError(
-                    f"Worker for session {session_id} is dead (pid {session.process.pid}). "
+                    f"Worker for {session.resolved_path} is no longer alive. "
                     "Close and re-open the binary."
                 )
             session.last_accessed = datetime.now()
-            session._lock.acquire()
+            worker.io_lock.acquire()
 
-        # self._lock is released — other sessions can proceed.
-        # session._lock is held — close_session will block on _terminate_worker
-        # because we hold the I/O lock.
+        # Outside self._lock; holding worker.io_lock — close that
+        # involves termination will block on it.
         try:
-            request_line = json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-            ).encode() + b"\n"
-            try:
-                session.process.stdin.write(request_line)
-                session.process.stdin.flush()
-                response_line = session.process.stdout.readline()
-            except (BrokenPipeError, OSError) as e:
-                raise RuntimeError(
-                    f"Worker pipe broken for session {session_id}: {e}"
-                ) from e
+            return self._call_worker_locked(worker, method, params)
         finally:
-            session._lock.release()
+            worker.io_lock.release()
 
+    # ------------------------------------------------------------------
+    # Internal: worker I/O
+    # ------------------------------------------------------------------
+
+    def _call_worker_locked(
+        self, worker: IDAWorker, method: str, params: dict
+    ) -> dict:
+        """Send one JSON-RPC request.  Must be called with worker.io_lock held."""
+        request_line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        ).encode() + b"\n"
+        try:
+            worker.process.stdin.write(request_line)
+            worker.process.stdin.flush()
+            response_line = worker.process.stdout.readline()
+        except (BrokenPipeError, OSError) as e:
+            raise RuntimeError(
+                f"Worker pipe broken for {worker.resolved_path}: {e}"
+            ) from e
         if not response_line:
             raise RuntimeError(
-                f"Worker for session {session_id} closed unexpectedly"
+                f"Worker for {worker.resolved_path} closed unexpectedly"
             )
         return json.loads(response_line)
 
-    def get_session(self, session_id: str) -> Optional[IDAWorkerSession]:
-        with self._lock:
-            return self._sessions.get(session_id)
-
-    def list_sessions(self) -> list[dict]:
-        """Return only sessions whose worker is ready for tool calls.
-
-        Pending opens are deliberately excluded — they appear here only
-        after ``WORKER_READY`` is received.
-        """
-        with self._lock:
-            return [s.to_dict() for s in self._sessions.values()]
-
-    def list_pending(self) -> list[dict]:
-        """Return status entries for in-flight opens (mainly for debugging)."""
-        with self._lock:
-            return [p.to_status_dict() for p in self._pending.values()]
-
-    def close_all_sessions(self) -> None:
-        with self._lock:
-            sessions = list(self._sessions.values())
-            self._sessions.clear()
-            pendings = list(self._pending.values())
-            # Don't clear _pending here — _finalise_pending() will remove
-            # entries as monitor threads exit, and we want the kill to
-            # propagate via EOF detection.
-        for session in sessions:
-            with session._lock:
-                self._terminate_worker(session)
-        for pending in pendings:
-            self._kill_process(pending.process)
-        logger.info("All sessions closed")
+    def _save_database(self, worker: IDAWorker) -> tuple[bool, Optional[str]]:
+        """Call save_database on *worker*.  Returns (success, error_message)."""
+        if not worker.alive:
+            return False, "Worker is not alive"
+        with worker.io_lock:
+            try:
+                response = self._call_worker_locked(
+                    worker,
+                    "tools/call",
+                    {"name": "save_database", "arguments": {}},
+                )
+            except Exception as e:  # noqa: BLE001 — surface as save error
+                logger.warning("save_database failed for %s: %s", worker.resolved_path, e)
+                return False, str(e)
+        if "error" in response:
+            msg = response["error"].get("message", str(response["error"]))
+            logger.warning("save_database error for %s: %s", worker.resolved_path, msg)
+            return False, msg
+        result = response.get("result", {})
+        if isinstance(result, dict) and result.get("isError"):
+            text = ""
+            for c in result.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = c.get("text", "")
+                    break
+            logger.warning("save_database returned isError for %s: %s", worker.resolved_path, text)
+            return False, text or "save_database returned isError"
+        return True, None
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal: lookup helpers
+    # ------------------------------------------------------------------
+
+    def _find_agent_session_for_path(
+        self, agent_id: str, resolved: str
+    ) -> Optional[AgentSession]:
+        for s in self._agent_sessions.get(agent_id, {}).values():
+            if s.resolved_path == resolved:
+                return s
+        return None
+
+    def _find_pending_for_agent_session(
+        self, agent_id: str, session_id: str
+    ) -> Optional[PendingOpen]:
+        for pending in self._pending.values():
+            if pending.refs.get(agent_id) == session_id:
+                return pending
+        return None
+
+    def _allocate_session_id(self, agent_id: str) -> str:
+        """Mint a short ID unique within *agent_id*."""
+        existing = self._agent_sessions.get(agent_id, {})
+        pending_ids = {
+            sid for p in self._pending.values()
+            if (sid := p.refs.get(agent_id)) is not None
+        }
+        for _ in range(64):
+            candidate = uuid.uuid4().hex[:8]
+            if candidate not in existing and candidate not in pending_ids:
+                return candidate
+        # Extremely unlikely, but fall back to full UUID rather than loop forever.
+        return uuid.uuid4().hex
+
+    def _mint_agent_session(self, agent_id: str, resolved: str) -> AgentSession:
+        session_id = self._allocate_session_id(agent_id)
+        session = AgentSession(
+            agent_id=agent_id,
+            session_id=session_id,
+            resolved_path=resolved,
+        )
+        self._agent_sessions.setdefault(agent_id, {})[session_id] = session
+        return session
+
+    # ------------------------------------------------------------------
+    # Internal: spawn lifecycle
     # ------------------------------------------------------------------
 
     def _begin_spawn(
@@ -287,11 +496,9 @@ class IDASessionManager:
 
         Called with ``self._lock`` held.
         """
-        session_id = str(uuid.uuid4())[:8]
         process = self._start_worker_process(input_path)
         pending = PendingOpen(
             resolved_path=resolved,
-            session_id=session_id,
             process=process,
             started_at=datetime.now(),
             ready_event=threading.Event(),
@@ -302,7 +509,7 @@ class IDASessionManager:
             target=self._monitor_spawn,
             args=(pending, spawn_timeout),
             daemon=True,
-            name=f"idalib-spawn-{session_id}",
+            name=f"idalib-spawn-{resolved}",
         )
         monitor.start()
         return pending
@@ -315,16 +522,11 @@ class IDASessionManager:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # inherit parent stderr → journal / terminal
+            stderr=None,
         )
 
     def _monitor_spawn(self, pending: PendingOpen, timeout: float) -> None:
-        """Background thread: wait for WORKER_READY (cross-platform).
-
-        A nested reader thread does the blocking ``readline()`` (so it
-        works on Windows, where ``select`` doesn't accept pipe FDs), and
-        an Event lets us bound the wait by ``timeout``.
-        """
+        """Background thread: wait for WORKER_READY (cross-platform)."""
         proc = pending.process
         result: list[tuple[bool, Optional[str]]] = []
         done = threading.Event()
@@ -354,14 +556,14 @@ class IDASessionManager:
                         done.set()
                         return
                     # Other lines (debug logs etc.) are ignored.
-            except Exception as e:  # noqa: BLE001 — propagate as spawn error
+            except Exception as e:  # noqa: BLE001
                 result.append((False, f"Reader thread crashed: {e}"))
                 done.set()
 
         threading.Thread(
             target=reader,
             daemon=True,
-            name=f"idalib-reader-{pending.session_id}",
+            name=f"idalib-reader-{pending.resolved_path}",
         ).start()
 
         if done.wait(timeout=timeout):
@@ -373,8 +575,6 @@ class IDASessionManager:
                 self._finalise_pending(pending, error=err)
             return
 
-        # Hard spawn timeout — kill the worker so the reader thread
-        # unblocks via EOF, then surface the failure to any waiter.
         self._kill_process(proc)
         self._finalise_pending(
             pending, error=f"Worker did not become ready within {timeout}s"
@@ -387,17 +587,14 @@ class IDASessionManager:
         ok: bool = False,
         error: Optional[str] = None,
     ) -> None:
-        """Move a pending entry to either _sessions or the error slot.
+        """Promote a pending entry to a worker (or surface failure to waiters).
 
-        If the pending entry has been displaced (e.g. by
-        ``close_all_sessions`` clearing state) we do NOT promote it to
-        a session — instead the worker is killed and the failure is
-        surfaced to waiters.  This keeps ``_sessions`` consistent with
-        ``_pending``: every live session went through a real spawn that
-        nobody else cancelled.
-
-        The ``ready_event`` is set last so any waiter observes a
-        consistent view of either ``_sessions`` or ``pending.error``.
+        Materialises every agent waiting on the pending into an
+        AgentSession + worker.refs entry, so callers wake up with their
+        session ready to use.  Identity-checks ``_pending[path] is pending``
+        before promoting so displaced pendings (e.g. after
+        ``close_all_sessions``) get their workers killed instead of
+        leaking into ``_workers``.
         """
         promoted = False
         with self._lock:
@@ -407,23 +604,27 @@ class IDASessionManager:
                 self._pending.pop(pending.resolved_path)
 
             if owned and ok:
-                session = IDAWorkerSession(
-                    session_id=pending.session_id,
-                    input_path=Path(pending.resolved_path),
+                worker = IDAWorker(
+                    resolved_path=pending.resolved_path,
                     process=pending.process,
                 )
-                self._sessions[pending.session_id] = session
+                self._workers[pending.resolved_path] = worker
+                for agent_id, agent_session_id in pending.refs.items():
+                    session = AgentSession(
+                        agent_id=agent_id,
+                        session_id=agent_session_id,
+                        resolved_path=pending.resolved_path,
+                    )
+                    self._agent_sessions.setdefault(agent_id, {})[agent_session_id] = session
+                    worker.refs.add((agent_id, agent_session_id))
                 promoted = True
                 logger.info(
-                    "Session %s ready: %s (pid %d)",
-                    pending.session_id,
-                    session.input_path.name,
+                    "Worker ready: %s (pid %d, %d agent ref(s))",
+                    Path(pending.resolved_path).name,
                     pending.process.pid,
+                    len(worker.refs),
                 )
             elif not owned:
-                # Another path displaced this pending — most likely a
-                # reset.  Discard the worker so we don't leak a dead-end
-                # subprocess, and surface a clear error to waiters.
                 pending.error = "Spawn cancelled (pending entry was displaced)"
                 logger.warning(
                     "Pending for %s was displaced; discarding worker",
@@ -440,9 +641,19 @@ class IDASessionManager:
         if not promoted:
             self._kill_process(pending.process)
 
-        # Signal waiters AFTER releasing the lock so they observe
-        # _sessions / pending.error in the correct state.
         pending.ready_event.set()
+
+    # ------------------------------------------------------------------
+    # Internal: termination
+    # ------------------------------------------------------------------
+
+    def _drop_worker(self, worker: IDAWorker) -> None:
+        """Remove a worker from _workers and from every agent's session map."""
+        self._workers.pop(worker.resolved_path, None)
+        for agent_id, agent_session_id in list(worker.refs):
+            sessions = self._agent_sessions.get(agent_id, {})
+            sessions.pop(agent_session_id, None)
+        worker.refs.clear()
 
     @staticmethod
     def _kill_process(proc: subprocess.Popen) -> None:
@@ -450,29 +661,44 @@ class IDASessionManager:
             return
         try:
             proc.kill()
-        except Exception as e:  # noqa: BLE001 — best-effort cleanup
+        except Exception as e:  # noqa: BLE001
             logger.warning("Failed to kill worker pid %d: %s", proc.pid, e)
 
     @staticmethod
-    def _terminate_worker(session: IDAWorkerSession) -> None:
-        proc = session.process
+    def _terminate_worker(worker: IDAWorker) -> None:
+        proc = worker.process
         if proc.poll() is not None:
             return
         logger.info(
-            "Terminating worker pid %d (session %s)", proc.pid, session.session_id
+            "Terminating worker pid %d (%s)", proc.pid, worker.resolved_path
         )
-        # Close stdin to signal the worker's stdio loop to exit.
         try:
             proc.stdin.close()
         except OSError:
             pass
-        # Then send SIGTERM for the graceful close_database() handler.
         proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             logger.warning("Worker pid %d did not exit, killing", proc.pid)
             proc.kill()
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    def close_all_sessions(self) -> None:
+        with self._lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+            self._agent_sessions.clear()
+            pendings = list(self._pending.values())
+        for worker in workers:
+            with worker.io_lock:
+                self._terminate_worker(worker)
+        for pending in pendings:
+            self._kill_process(pending.process)
+        logger.info("All sessions closed")
 
 
 # ------------------------------------------------------------------
