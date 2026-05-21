@@ -887,3 +887,147 @@ def test_open_session_wait_timeout_none_blocks_until_ready(tmp_path):
     assert not isinstance(result, dict)
     assert result.session_id is not None
     assert elapsed >= 0.25
+
+
+# ---------------------------------------------------------------------------
+# Multi-threaded HTTP server + supervisor lock discipline
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_server_serve_always_uses_threading_http_server():
+    """Both background=True and background=False must give a threaded server.
+
+    Single-threaded HTTPServer at the supervisor would serialise every
+    request, so a long-running tool call from one agent would stall
+    every other agent — defeating the multi-agent isolation work.
+    """
+    from http.server import ThreadingHTTPServer
+
+    for background in (True, False):
+        srv = supmod.McpServer(f"test-{background}")
+        srv.serve(host="127.0.0.1", port=0, background=True)
+        try:
+            assert isinstance(srv._http_server, ThreadingHTTPServer), (
+                f"serve(background={background}) selected "
+                f"{type(srv._http_server).__name__} instead of ThreadingHTTPServer"
+            )
+        finally:
+            srv.stop()
+
+
+def test_bind_context_blocks_while_supervisor_lock_is_held():
+    """A concurrent bind_context() must serialise on self._lock so that
+    release_session()'s recheck-then-terminate window is consistent.
+    """
+    import threading as _threading
+    import time as _time
+
+    sup = supmod.IdalibSupervisor(_BearerMcp())
+
+    lock_held = _threading.Event()
+    finish_holding = _threading.Event()
+
+    def hold_lock():
+        with sup._lock:
+            lock_held.set()
+            finish_holding.wait(timeout=2.0)
+
+    holder = _threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(timeout=1.0)
+
+    bind_done = _threading.Event()
+
+    def try_bind():
+        sup.bind_context("ctxA", "sess1")
+        bind_done.set()
+
+    binder = _threading.Thread(target=try_bind)
+    binder.start()
+    # Give the binder enough time to attempt and block.
+    _time.sleep(0.1)
+    assert not bind_done.is_set(), "bind_context did not block on the supervisor lock"
+
+    # Release the holder; binder should now make progress.
+    finish_holding.set()
+    holder.join(timeout=2.0)
+    binder.join(timeout=2.0)
+    assert bind_done.is_set()
+    assert sup.context_bindings == {"ctxA": "sess1"}
+
+
+def test_unbind_context_blocks_while_supervisor_lock_is_held():
+    import threading as _threading
+    import time as _time
+
+    sup = supmod.IdalibSupervisor(_BearerMcp())
+    sup.bind_context("ctxA", "sess1")
+
+    lock_held = _threading.Event()
+    finish_holding = _threading.Event()
+
+    def hold_lock():
+        with sup._lock:
+            lock_held.set()
+            finish_holding.wait(timeout=2.0)
+
+    holder = _threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(timeout=1.0)
+
+    unbind_result: list[bool] = []
+
+    def try_unbind():
+        unbind_result.append(sup.unbind_context("ctxA"))
+
+    unbinder = _threading.Thread(target=try_unbind)
+    unbinder.start()
+    _time.sleep(0.1)
+    assert not unbind_result, "unbind_context did not block on the supervisor lock"
+
+    finish_holding.set()
+    holder.join(timeout=2.0)
+    unbinder.join(timeout=2.0)
+    assert unbind_result == [True]
+    assert sup.context_bindings == {}
+
+
+def test_concurrent_iteration_and_bind_does_not_raise(tmp_path):
+    """Hammer context_bindings to make sure dict iteration under the
+    lock never collides with a bind/unbind that bypassed it.
+    """
+    import threading as _threading
+    import time as _time
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    sup.open_session(str(sample), session_id="shared", context_id="seed")
+
+    stop = _threading.Event()
+    errors: list[Exception] = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                # list_sessions iterates context_bindings under the lock.
+                sup.list_sessions(supmod.SHARED_FALLBACK_CONTEXT_ID)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+    def writer():
+        ctr = 0
+        while not stop.is_set():
+            sup.bind_context(f"ctx{ctr % 16}", "shared")
+            sup.unbind_context(f"ctx{(ctr - 1) % 16}")
+            ctr += 1
+
+    readers = [_threading.Thread(target=reader) for _ in range(4)]
+    writers = [_threading.Thread(target=writer) for _ in range(4)]
+    for t in readers + writers:
+        t.start()
+    _time.sleep(0.3)
+    stop.set()
+    for t in readers + writers:
+        t.join(timeout=2.0)
+    assert not errors, f"hammer test raised: {errors[:3]}"

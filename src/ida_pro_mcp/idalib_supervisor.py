@@ -380,10 +380,18 @@ class IdalibSupervisor:
         }
 
     def bind_context(self, context_id: str, session_id: str) -> None:
-        self.context_bindings[context_id] = session_id
+        # Acquired even though dict[]= is atomic in CPython: callers
+        # like release_session() decide whether to terminate a worker
+        # based on a snapshot of context_bindings under self._lock, and
+        # an unlocked write here could slip in between their read and
+        # their decision.  RLock makes calls from already-locked code
+        # (open_session, _finalise_pending) safe.
+        with self._lock:
+            self.context_bindings[context_id] = session_id
 
     def unbind_context(self, context_id: str) -> bool:
-        return self.context_bindings.pop(context_id, None) is not None
+        with self._lock:
+            return self.context_bindings.pop(context_id, None) is not None
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
