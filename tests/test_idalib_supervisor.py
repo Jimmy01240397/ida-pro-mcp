@@ -992,6 +992,66 @@ def test_unbind_context_blocks_while_supervisor_lock_is_held():
     assert sup.context_bindings == {}
 
 
+def test_concurrent_forward_to_same_session_runs_in_parallel(tmp_path):
+    """Two tool calls to the SAME session must run in parallel at the
+    supervisor — serialisation should happen at the worker (via
+    @idasync / execute_sync), not at the supervisor layer.
+    """
+    import threading as _threading
+    import time as _time
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+
+    class _SlowForward(_FakeSupervisor):
+        def __init__(self):
+            super().__init__()
+            self.concurrent_peak = 0
+            self._active = 0
+            self._peak_lock = _threading.Lock()
+
+        def _worker_rpc(self, worker, payload, *, timeout=None):
+            method = payload.get("method")
+            # tools/list and resources/list pre-cache during open_session
+            # via _FakeSupervisor.worker_tools(); we only care about the
+            # forwarded tool calls.
+            if method in {"tools/list", "resources/list", "resources/templates/list"}:
+                return super()._worker_rpc(worker, payload, timeout=timeout)
+            with self._peak_lock:
+                self._active += 1
+                self.concurrent_peak = max(self.concurrent_peak, self._active)
+            _time.sleep(0.2)
+            with self._peak_lock:
+                self._active -= 1
+            return super()._worker_rpc(worker, payload, timeout=timeout)
+
+    sup = _SlowForward()
+    sup.open_session(str(sample), session_id="shared", context_id="ctx")
+    target = sup.sessions["shared"]
+
+    def call(i: int):
+        sup.forward_raw(target, {
+            "jsonrpc": "2.0", "id": i, "method": "tools/call",
+            "params": {"name": "decompile", "arguments": {"addr": "0x0"}},
+        })
+
+    threads = [_threading.Thread(target=call, args=(i,)) for i in range(4)]
+    t0 = _time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3.0)
+        assert not t.is_alive()
+    elapsed = _time.monotonic() - t0
+
+    # If forward_raw serialised on a supervisor lock, elapsed ≈ 4 × 0.2 = 0.8s.
+    # With true parallelism it should be ~0.2-0.4s.
+    assert elapsed < 0.7, f"forward_raw was serialised at supervisor (took {elapsed:.2f}s)"
+    assert sup.concurrent_peak >= 2, (
+        f"never observed >=2 concurrent forwards (peak={sup.concurrent_peak})"
+    )
+
+
 def test_concurrent_iteration_and_bind_does_not_raise(tmp_path):
     """Hammer context_bindings to make sure dict iteration under the
     lock never collides with a bind/unbind that bypassed it.
