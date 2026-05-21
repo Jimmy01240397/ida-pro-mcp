@@ -726,6 +726,73 @@ def test_release_session_unknown_id_returns_error():
     }
 
 
+def test_concurrent_release_from_two_agents_terminates_exactly_once(tmp_path):
+    """A and B both hold the same session and call release_session at
+    the same time. Exactly one must observe is_last (and terminate the
+    worker); the other must observe a non-terminating release with
+    remaining_refs == 1.
+
+    Race anchor: step-1 pop is under self._lock, so the two pops
+    serialize. Whichever pops first computes remaining=1; the second
+    computes remaining=0 and runs the terminate path.
+    """
+    import threading as _threading
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _make_saving_sup()
+    sup.open_session(str(sample), session_id="shared", context_id="ctxA")
+    sup.bind_context("ctxB", "shared")
+    assert "shared" in sup.sessions
+    assert set(sup.context_bindings) == {"ctxA", "ctxB"}
+
+    # Slow the save so both threads have time to enter step 2.
+    barrier = _threading.Barrier(2, timeout=2.0)
+    original_save = sup._save_session_idb
+
+    def slow_save(session):
+        try:
+            barrier.wait()
+        except _threading.BrokenBarrierError:
+            pass
+        return original_save(session)
+
+    sup._save_session_idb = slow_save
+
+    outcomes: dict[str, dict] = {}
+
+    def release(ctx: str):
+        outcomes[ctx] = sup.release_session("shared", ctx)
+
+    ta = _threading.Thread(target=release, args=("ctxA",))
+    tb = _threading.Thread(target=release, args=("ctxB",))
+    ta.start()
+    tb.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+    assert not ta.is_alive() and not tb.is_alive()
+
+    # Exactly one observed is_last (terminated=True) — never both.
+    terminated = [c for c, r in outcomes.items() if r["terminated"]]
+    not_terminated = [c for c, r in outcomes.items() if not r["terminated"]]
+    assert len(terminated) == 1, f"expected exactly one terminator, got {terminated}"
+    assert len(not_terminated) == 1
+    # The non-terminator's snapshot saw exactly one remaining ref (the
+    # other agent that hadn't entered step 1 yet).
+    other = outcomes[not_terminated[0]]
+    assert other["released"] is True
+    assert other["remaining_refs"] == 1
+    # The terminator's save MUST succeed (it's the one that has to hit
+    # disk before terminate). The non-terminator's save can race
+    # against the terminator's terminate (instant in this fake fixture,
+    # real HTTP I/O in production), so we only assert the terminator
+    # got persisted — the non-terminator's outcome is best-effort.
+    assert outcomes[terminated[0]]["saved"] is True
+    # End state: worker gone, no bindings left.
+    assert "shared" not in sup.sessions
+    assert sup.context_bindings == {}
+
+
 def test_release_session_concurrent_open_keeps_worker_alive(tmp_path):
     """Race: A is the last holder and starts save; B opens during the save
     and adds a ref. A's post-save recheck must SKIP the terminate.
