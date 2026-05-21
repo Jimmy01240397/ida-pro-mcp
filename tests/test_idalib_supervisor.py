@@ -609,13 +609,37 @@ def test_resolve_context_id_bearer_wins_over_isolated_when_both_set():
     assert sup.resolve_context_id() == "bearer:agent_alice"
 
 
-def test_context_fields_surfaces_bearer_state():
+def test_context_fields_surfaces_bearer_state_without_leaking_agent_id():
+    """The hashed Bearer token must not appear in responses — neither
+    as a dedicated ``agent_id`` field nor embedded in ``context_id``.
+    """
     mcp = _BearerMcp(agent_id="agent_alice", session_id="http:abc")
     sup = supmod.IdalibSupervisor(mcp, bearer_contexts=True)
-    fields = sup.context_fields(sup.resolve_context_id())
-    assert fields["context_id"] == "bearer:agent_alice"
-    assert fields["agent_id"] == "agent_alice"
+    raw_context_id = sup.resolve_context_id()
+    fields = sup.context_fields(raw_context_id)
+    # Internally the supervisor still keys by the hash for isolation.
+    assert raw_context_id == "bearer:agent_alice"
+    # The public response masks the hash to just the mode marker.
+    assert fields["context_id"] == "bearer"
+    assert "agent_id" not in fields
+    assert "agent_alice" not in str(fields), (
+        f"Bearer hash leaked into response: {fields}"
+    )
     assert fields["bearer_contexts"] is True
+
+
+def test_context_fields_passes_non_bearer_context_ids_through():
+    """Non-Bearer context_ids are either already-known to the caller
+    (transport Mcp-Session-Id) or non-sensitive — keep them as-is."""
+    # MCP transport session
+    mcp = _BearerMcp(session_id="http:user-known-session")
+    sup = supmod.IdalibSupervisor(mcp, isolated_contexts=True)
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["context_id"] == "http:user-known-session"
+    # Shared fallback
+    sup2 = supmod.IdalibSupervisor(_BearerMcp())
+    fields2 = sup2.context_fields(sup2.resolve_context_id())
+    assert fields2["context_id"] == supmod.SHARED_FALLBACK_CONTEXT_ID
 
 
 # ---------------------------------------------------------------------------

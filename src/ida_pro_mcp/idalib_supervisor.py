@@ -91,7 +91,6 @@ class IdalibContextFields(TypedDict):
     transport_context_id: NotRequired[str | None]
     isolated_contexts: NotRequired[bool]
     bearer_contexts: NotRequired[bool]
-    agent_id: NotRequired[str | None]
 
 
 class IdalibSessionInfo(TypedDict):
@@ -371,12 +370,19 @@ class IdalibSupervisor:
         return SHARED_FALLBACK_CONTEXT_ID
 
     def context_fields(self, context_id: str) -> IdalibContextFields:
+        # The internal context_id for Bearer mode is "bearer:<hashed-token>".
+        # Don't echo the hash to the caller — the agent shouldn't see
+        # what server-side identity their token resolves to (it's a
+        # stable derivative of their secret). Other context-id flavours
+        # are either already-known to the caller (transport
+        # Mcp-Session-Id) or non-sensitive constants (shared:fallback,
+        # stdio:default), so they pass through unchanged.
+        public_context_id = "bearer" if context_id.startswith("bearer:") else context_id
         return {
-            "context_id": context_id,
+            "context_id": public_context_id,
             "transport_context_id": self.mcp.get_current_transport_session_id(),
             "isolated_contexts": self.isolated_contexts,
             "bearer_contexts": self.bearer_contexts,
-            "agent_id": self._current_agent_id(),
         }
 
     def bind_context(self, context_id: str, session_id: str) -> None:
