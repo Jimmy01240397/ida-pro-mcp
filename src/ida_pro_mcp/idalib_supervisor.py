@@ -1047,16 +1047,19 @@ class IdalibSupervisor:
             session.lock.release()
 
         # Phase C — state lock alone for the bookkeeping mutation.
-        # Releasing session.lock before retaking state keeps lock
-        # order strictly state→session and prevents head-of-line
-        # blocking when many closes pile up on this session.
+        # Re-verify the binding before popping: during Phase B (save,
+        # state lock free) a concurrent open / idalib_switch on the
+        # same context_id could have rebound it to a DIFFERENT
+        # session. We must NOT pop in that case — popping would
+        # silently delete the other thread's binding.
         with self._lock:
-            if had_binding:
+            still_bound = self.context_bindings.get(context_id) == session_id
+            if still_bound:
                 self.context_bindings.pop(context_id, None)
             remaining = sum(
                 1 for b in self.context_bindings.values() if b == session_id
             )
-            if had_binding and remaining == 0:
+            if still_bound and remaining == 0:
                 popped = self._unregister_session_locked(session_id)
             else:
                 popped = None
@@ -1064,7 +1067,7 @@ class IdalibSupervisor:
         if popped is None:
             return {
                 "success": True,
-                "released": had_binding,
+                "released": still_bound,
                 "terminated": False,
                 "remaining_refs": remaining,
                 "saved": saved,
