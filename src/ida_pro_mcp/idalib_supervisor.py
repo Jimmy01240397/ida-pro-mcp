@@ -1194,12 +1194,19 @@ class IdalibSupervisor:
         raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
 
     @contextmanager
-    def session_scope(self, database: str | None = None):
+    def session_scope(
+        self,
+        database: str | None = None,
+        *,
+        bind: str | None = None,
+    ):
         """Resolve a session and hold its lock for the body of the
         ``with`` block. State→session hand-off:
 
             with self._lock:
                 session = resolve(database)
+                if bind is not None:
+                    context_bindings[bind] = session.session_id
                 session.lock.acquire()
             # state released, session.lock held
 
@@ -1207,17 +1214,27 @@ class IdalibSupervisor:
         do NOT need their own ``self._lock`` acquisition for this
         session — the hand-off above is atomic.
 
-        For sessions whose worker is no longer alive but were attached
-        via the GUI backend, the manager reopens them headlessly
-        before yielding. Headless reopen happens OUTSIDE the original
-        session.lock (a new ``WorkerSession`` with a fresh lock is
-        produced) — the yielded session is the replacement.
+        Critical: code inside the ``with`` block MUST NOT acquire
+        ``self._lock`` itself. session.lock is held throughout the
+        body and any nested state acquisition would create a
+        session→state ordering that deadlocks against
+        ``release_session``'s state→session path. Pass any context
+        binding you want to make via ``bind=context_id`` so it lands
+        atomically during the hand-off; do every other state mutation
+        BEFORE entering or AFTER exiting the ``with`` block.
+
+        For GUI-backed sessions whose worker is no longer alive,
+        reopen happens outside any lock and a fresh ``WorkerSession``
+        is yielded.
         """
         with self._lock:
             session = self._resolve_session_locked(database)
             session.last_accessed = datetime.now()
-            # Cheap probe — for worker backend, just process.poll();
-            # for GUI we punt to the reopen path outside the lock.
+            if bind is not None:
+                self.context_bindings[bind] = session.session_id
+            # Cheap liveness probe — for worker backend, just
+            # process.poll(); for GUI we punt to the reopen path
+            # outside the lock.
             if session.backend == "worker" and session.is_alive():
                 session.lock.acquire()
                 holding = session
@@ -1529,17 +1546,17 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        # Bind is a single state-dict mutation; resolve_session +
-        # bind_context both serialise on state lock alone, no
-        # session.lock needed (we never touch the worker).
-        session = sup.resolve_session(session_id)
-        sup.bind_context(context_id, session.session_id)
-        return {
-            "success": True,
-            **sup.context_fields(context_id),
-            "session": session.to_dict(),
-            "message": f"Bound context to session: {session.session_id} ({session.filename})",
-        }
+        # Hand-off: bind happens atomically with the resolve under the
+        # state lock; session.lock is then held for the (empty) body
+        # so a concurrent close can't terminate the session between
+        # the bind and our return.
+        with sup.session_scope(session_id, bind=context_id) as session:
+            return {
+                "success": True,
+                **sup.context_fields(context_id),
+                "session": session.to_dict(),
+                "message": f"Bound context to session: {session.session_id} ({session.filename})",
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1594,9 +1611,8 @@ def idalib_current() -> IdalibCurrentResult:
                 "error": "No session bound for this context. Use idalib_open(...) or idalib_switch(session_id) first.",
                 **sup.context_fields(context_id),
             }
-        # Read-only metadata snapshot; state lock alone is enough.
-        session = sup.resolve_session(session_id)
-        return {**session.to_dict(), **sup.context_fields(context_id)}
+        with sup.session_scope(session_id) as session:
+            return {**session.to_dict(), **sup.context_fields(context_id)}
     except Exception as e:
         return {"error": f"Failed to get current session: {e}"}
 
@@ -1610,9 +1626,11 @@ def idalib_save(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        with sup.session_scope(session_id) as session:
-            if session_id:
-                sup.bind_context(context_id, session.session_id)
+        # Bind in the hand-off so we never re-acquire state under
+        # session.lock (which would deadlock against release_session's
+        # state→session order).
+        bind = context_id if session_id else None
+        with sup.session_scope(session_id, bind=bind) as session:
             tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
             result = sup.call_worker_tool(session, tool_name, {"path": path})
             if isinstance(result, dict):
@@ -1630,9 +1648,8 @@ def idalib_health(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        with sup.session_scope(session_id) as session:
-            if session_id:
-                sup.bind_context(context_id, session.session_id)
+        bind = context_id if session_id else None
+        with sup.session_scope(session_id, bind=bind) as session:
             if session.backend == "gui":
                 health = sup.call_worker_tool(session, "server_health", {})
                 return {
@@ -1661,9 +1678,8 @@ def idalib_warmup(
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        with sup.session_scope(session_id) as session:
-            if session_id:
-                sup.bind_context(context_id, session.session_id)
+        bind = context_id if session_id else None
+        with sup.session_scope(session_id, bind=bind) as session:
             if session.backend == "gui":
                 warmup = sup.call_worker_tool(
                     session,
