@@ -19,12 +19,13 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Annotated, Any, NotRequired, Optional, TypedDict
+from typing import Annotated, Any, NotRequired, Optional, TypedDict, Union
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
+    "idalib_list_pending",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 
@@ -112,10 +114,28 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     worker_pid: int | None
 
 
+class IdalibPendingInfo(TypedDict, total=False):
+    status: str  # always "opening"
+    session_id: str
+    resolved_path: str
+    filename: str
+    started_at: str
+    elapsed_seconds: float
+    contexts_waiting: int
+
+
 class IdalibOpenResult(IdalibContextFields, total=False):
     success: bool
+    status: str  # "ready" | "opening"
     session: IdalibSessionInfo
+    pending: IdalibPendingInfo
     message: str
+    error: str
+
+
+class IdalibPendingListResult(IdalibContextFields, total=False):
+    pending: list[IdalibPendingInfo]
+    count: int
     error: str
 
 
@@ -179,6 +199,41 @@ class IdalibWarmupResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo | None
     warmup: dict[str, Any] | None
     error: str | None
+
+
+@dataclass
+class PendingOpen:
+    """An open_session that hasn't materialised a worker session yet.
+
+    All concurrent callers asking for the same path during the spawn
+    window join the same PendingOpen — exactly one worker is started.
+    When the spawn finishes the contexts in ``contexts_waiting`` are
+    bound atomically and ``ready_event`` is set so every blocked open
+    call wakes up.
+    """
+
+    resolved_path: str
+    session_id: str
+    started_at: datetime
+    ready_event: threading.Event
+    contexts_waiting: list[str] = field(default_factory=list)
+    run_auto_analysis: bool = True
+    error: Optional[str] = None
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (datetime.now() - self.started_at).total_seconds()
+
+    def to_status_dict(self) -> IdalibPendingInfo:
+        return {
+            "status": "opening",
+            "session_id": self.session_id,
+            "resolved_path": self.resolved_path,
+            "filename": Path(self.resolved_path).name,
+            "started_at": self.started_at.isoformat(),
+            "elapsed_seconds": self.elapsed_seconds,
+            "contexts_waiting": len(self.contexts_waiting),
+        }
 
 
 @dataclass
@@ -247,6 +302,9 @@ class IdalibSupervisor:
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
         self.context_bindings: dict[str, str] = {}
+        # In-flight opens, keyed by resolved-path; concurrent open_session()
+        # calls for the same path coalesce onto a single PendingOpen entry.
+        self._pending: dict[str, PendingOpen] = {}
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
@@ -613,116 +671,190 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         session_id: str | None = None,
         context_id: str | None = None,
-    ) -> WorkerSession:
+        wait_timeout: float = 10.0,
+    ) -> Union[WorkerSession, IdalibPendingInfo]:
+        """Open *input_path* for *context_id*, returning a session or pending status.
+
+        * Returns a ``WorkerSession`` if the worker is ready within
+          ``wait_timeout`` seconds.
+        * Returns an :class:`IdalibPendingInfo` dict otherwise; the
+          spawn keeps running in the background. Subsequent
+          ``open_session`` calls for the same path coalesce onto the
+          same pending and either wake up on it becoming ready or get
+          their own pending dict back.
+        * Concurrent callers (any agent / any context) for the same
+          path always share one worker.
+
+        Pass ``wait_timeout=float('inf')`` to block until ready (used by
+        the startup --input_path path).
+        """
         resolved = self._normalize_input_path(input_path)
+        path_key = self._path_key(resolved)
         requested_session_id = session_id
+
         with self._lock:
-            existing = self.path_to_session.get(self._path_key(resolved))
-            if existing is not None:
-                session = self.sessions.get(existing)
+            # 1. Live session for this path → reuse.
+            existing_sid = self.path_to_session.get(path_key)
+            if existing_sid is not None:
+                session = self.sessions.get(existing_sid)
                 if session is not None and session.is_alive():
-                    if requested_session_id is not None and requested_session_id != existing:
+                    if requested_session_id is not None and requested_session_id != existing_sid:
                         raise ValueError(
-                            f"Binary already open as session '{existing}', cannot reuse "
+                            f"Binary already open as session '{existing_sid}', cannot reuse "
                             f"different session_id '{requested_session_id}'."
                         )
                     session.last_accessed = datetime.now()
                     if context_id is not None:
-                        self.bind_context(context_id, existing)
+                        self.bind_context(context_id, existing_sid)
                     return session
-                self._unregister_session_locked(existing)
+                # Stale — drop it before starting fresh.
+                self._unregister_session_locked(existing_sid)
 
-            if session_id is None:
-                session_id = str(uuid.uuid4())[:8]
-            elif session_id in self.sessions:
-                raise ValueError(f"Session already exists: {session_id}")
+            # 2. Existing pending spawn → join it.
+            pending = self._pending.get(path_key)
+            start_spawn = False
+            if pending is not None:
+                if (
+                    requested_session_id is not None
+                    and requested_session_id != pending.session_id
+                ):
+                    raise ValueError(
+                        f"Binary already opening as session '{pending.session_id}', "
+                        f"cannot reuse different session_id '{requested_session_id}'."
+                    )
+                if context_id and context_id not in pending.contexts_waiting:
+                    pending.contexts_waiting.append(context_id)
+            else:
+                # 3. Brand-new spawn — allocate id and register pending.
+                if session_id is None:
+                    session_id = str(uuid.uuid4())[:8]
+                elif session_id in self.sessions:
+                    raise ValueError(f"Session already exists: {session_id}")
+                pending = PendingOpen(
+                    resolved_path=resolved,
+                    session_id=session_id,
+                    started_at=datetime.now(),
+                    ready_event=threading.Event(),
+                    contexts_waiting=[context_id] if context_id else [],
+                    run_auto_analysis=run_auto_analysis,
+                )
+                self._pending[path_key] = pending
+                start_spawn = True
 
-            gui_instance = self._find_gui_instance_for_path(resolved)
+        if start_spawn:
+            threading.Thread(
+                target=self._spawn_session_in_background,
+                args=(pending,),
+                daemon=True,
+                name=f"idalib-open-{pending.session_id}",
+            ).start()
+
+        # Wait outside the manager lock so other paths / contexts /
+        # tool calls can keep working.
+        pending.ready_event.wait(timeout=wait_timeout)
+
+        with self._lock:
+            session = self.sessions.get(pending.session_id)
+            if session is not None and session.is_alive():
+                # Late-arriving context_id: make sure it's bound before
+                # we hand the session back.
+                if context_id and self.context_bindings.get(context_id) != session.session_id:
+                    self.bind_context(context_id, session.session_id)
+                session.last_accessed = datetime.now()
+                return session
+            if pending.error:
+                raise RuntimeError(pending.error)
+            return pending.to_status_dict()
+
+    def _spawn_session_in_background(self, pending: PendingOpen) -> None:
+        path_key = self._path_key(pending.resolved_path)
+        try:
+            # GUI fallback wins over a fresh worker if discoverable.
+            gui_instance = self._find_gui_instance_for_path(pending.resolved_path)
             if gui_instance is not None:
-                session = self._make_gui_session(resolved, session_id, gui_instance)
-                self._register_session_locked(session, resolved, context_id)
+                session = self._make_gui_session(
+                    pending.resolved_path, pending.session_id, gui_instance
+                )
                 logger.info(
                     "Using GUI IDA instance %s:%s for %s",
                     session.host,
                     session.port,
-                    resolved,
+                    pending.resolved_path,
                 )
-                return session
+                self._finalise_pending(pending, session)
+                return
 
-            worker = self._allocate_worker_locked()
+            with self._lock:
+                worker = self._allocate_worker_locked()
 
-        try:
-            opened = self.call_worker_tool(
-                worker,
-                "idalib_open",
-                {
-                    "input_path": resolved,
-                    "run_auto_analysis": run_auto_analysis,
-                    "session_id": session_id,
-                },
+            try:
+                opened = self.call_worker_tool(
+                    worker,
+                    "idalib_open",
+                    {
+                        "input_path": pending.resolved_path,
+                        "run_auto_analysis": pending.run_auto_analysis,
+                        "session_id": pending.session_id,
+                    },
+                )
+                if isinstance(opened, dict) and opened.get("error"):
+                    raise RuntimeError(str(opened["error"]))
+            except Exception:
+                self._terminate_worker(worker)
+                raise
+
+            worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+            session = WorkerSession(
+                session_id=pending.session_id,
+                input_path=str(worker_session.get("input_path") or pending.resolved_path),
+                filename=str(worker_session.get("filename") or Path(pending.resolved_path).name),
+                is_analyzing=bool(worker_session.get("is_analyzing", False)),
+                metadata=dict(worker_session.get("metadata") or {}),
+                host=worker.host,
+                port=worker.port,
+                process=worker.process,
+                backend="worker",
+                owned=True,
+                pid=worker.process.pid if worker.process is not None else None,
             )
-            if isinstance(opened, dict) and opened.get("error"):
-                raise RuntimeError(str(opened["error"]))
-        except Exception:
-            self._terminate_worker(worker)
-            raise
+            self._finalise_pending(pending, session)
+        except Exception as e:
+            logger.warning(
+                "Background open for %s failed: %s", pending.resolved_path, e
+            )
+            with self._lock:
+                if self._pending.get(path_key) is pending:
+                    self._pending.pop(path_key)
+                pending.error = str(e)
+            pending.ready_event.set()
 
-        worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
-        session = WorkerSession(
-            session_id=session_id,
-            input_path=str(worker_session.get("input_path") or resolved),
-            filename=str(worker_session.get("filename") or Path(resolved).name),
-            is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata=dict(worker_session.get("metadata") or {}),
-            host=worker.host,
-            port=worker.port,
-            process=worker.process,
-            backend="worker",
-            owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
-        )
+    def _finalise_pending(
+        self, pending: PendingOpen, session: WorkerSession
+    ) -> None:
+        """Promote a finished spawn to a registered session.
+
+        Bindings for every context that joined the pending while it
+        was in flight are added atomically with the session
+        registration, so waiters wake up to a consistent
+        (sessions, context_bindings) snapshot.
+        """
+        path_key = self._path_key(pending.resolved_path)
         with self._lock:
-            existing = self.path_to_session.get(self._path_key(resolved))
-            if existing is not None:
-                existing_session = self.sessions.get(existing)
-                if existing_session is not None and existing_session.is_alive():
-                    existing_session.last_accessed = datetime.now()
-                    if context_id is not None:
-                        self.bind_context(context_id, existing)
-                    collision_error = None
-                    if requested_session_id is not None and requested_session_id != existing:
-                        collision_error = ValueError(
-                            f"Binary already open as session '{existing}', cannot reuse "
-                            f"different session_id '{requested_session_id}'."
-                        )
-                else:
-                    self._unregister_session_locked(existing)
-                    existing_session = None
-                    collision_error = None
-            else:
-                existing_session = None
-                collision_error = None
+            if self._pending.get(path_key) is pending:
+                self._pending.pop(path_key)
+            self._register_session_locked(session, pending.resolved_path, None)
+            for ctx in pending.contexts_waiting:
+                self.bind_context(ctx, session.session_id)
+        pending.ready_event.set()
 
-            session_collision_error = None
-            if existing_session is None:
-                existing_by_id = self.sessions.get(session_id)
-                if existing_by_id is not None:
-                    if existing_by_id.is_alive():
-                        existing_by_id.last_accessed = datetime.now()
-                        session_collision_error = ValueError(f"Session already exists: {session_id}")
-                    else:
-                        self._unregister_session_locked(session_id)
-
-            if existing_session is None and session_collision_error is None:
-                self._register_session_locked(session, resolved, context_id)
-                return session
-
-        self._discard_opened_worker_session(worker, session_id)
-        if collision_error is not None:
-            raise collision_error
-        if session_collision_error is not None:
-            raise session_collision_error
-        return existing_session
+    def list_pending(self, context_id: str) -> list[IdalibPendingInfo]:
+        """Return in-flight opens that *context_id* has requested."""
+        with self._lock:
+            return [
+                pending.to_status_dict()
+                for pending in self._pending.values()
+                if context_id in pending.contexts_waiting
+            ]
 
     def close_session(self, session_id: str) -> bool:
         """Force-close: drop ALL bindings + terminate worker.
@@ -964,6 +1096,15 @@ class IdalibSupervisor:
                 if len(matches) > 1:
                     raise RuntimeError(f"Database selector is ambiguous: {database}")
                 if not matches:
+                    # Friendlier message when the caller is using a
+                    # session_id from an in-flight idalib_open.
+                    for pending in self._pending.values():
+                        if database in (pending.session_id, pending.resolved_path):
+                            raise RuntimeError(
+                                f"Session {pending.session_id} is still opening "
+                                f"(elapsed={pending.elapsed_seconds:.1f}s). "
+                                f"Call idalib_open again to wait for it to be ready."
+                            )
                     raise RuntimeError(f"Database/session not found: {database}")
                 session_id = matches[0]
             else:
@@ -1084,25 +1225,73 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    wait_timeout: Annotated[
+        float,
+        "Seconds to wait for the worker to become ready before returning a pending status.",
+    ] = 10.0,
 ) -> IdalibOpenResult:
-    """Open a binary in its own idalib worker process and bind it to this context."""
+    """Open a binary and bind it to this context.
+
+    Returns ``{status: "ready", session: ...}`` once the worker is
+    live. If the spawn doesn't finish within ``wait_timeout`` seconds,
+    returns ``{status: "opening", pending: ...}`` instead — the worker
+    keeps loading in the background; call ``idalib_open`` again (or
+    ``idalib_list_pending``) to check on it.
+    """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        session = sup.open_session(
+        outcome = sup.open_session(
             input_path,
             run_auto_analysis=run_auto_analysis,
             session_id=session_id,
             context_id=context_id,
+            wait_timeout=wait_timeout,
         )
+        if isinstance(outcome, dict):
+            return {
+                "success": False,
+                "status": "opening",
+                **sup.context_fields(context_id),
+                "pending": outcome,
+                "message": (
+                    f"Binary is still opening: {outcome['filename']} "
+                    f"(session_id={outcome['session_id']}, "
+                    f"elapsed={outcome['elapsed_seconds']:.1f}s). "
+                    f"Call idalib_open again to wait for it to become ready."
+                ),
+            }
         return {
             "success": True,
+            "status": "ready",
             **sup.context_fields(context_id),
-            "session": session.to_dict(),
-            "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
+            "session": outcome.to_dict(),
+            "message": f"Binary opened and bound to context: {outcome.filename} ({outcome.session_id})",
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool
+def idalib_list_pending() -> IdalibPendingListResult:
+    """List binaries the calling context has requested but are still opening.
+
+    Each entry mirrors what ``idalib_open`` returns under its
+    ``pending`` key — same ``session_id``, ``elapsed_seconds`` etc.
+    Once a worker becomes ready the entry disappears from here and
+    shows up in ``idalib_list`` instead.
+    """
+    sup = _require_supervisor()
+    try:
+        context_id = sup.resolve_context_id()
+        pending = sup.list_pending(context_id)
+        return {
+            "pending": pending,
+            "count": len(pending),
+            **sup.context_fields(context_id),
+        }
+    except Exception as e:
+        return {"error": f"Failed to list pending opens: {e}"}
 
 
 @mcp.tool
@@ -1494,7 +1683,13 @@ def main() -> None:
     if args.input_path is not None:
         startup_context_id = STDIO_DEFAULT_CONTEXT_ID if args.isolated_contexts else SHARED_FALLBACK_CONTEXT_ID
         try:
-            supervisor.open_session(str(args.input_path), context_id=startup_context_id)
+            # Block until the worker is ready so the server is usable
+            # the moment its HTTP endpoint accepts connections.
+            supervisor.open_session(
+                str(args.input_path),
+                context_id=startup_context_id,
+                wait_timeout=float("inf"),
+            )
         except Exception as e:
             raise SystemExit(f"Failed to open initial binary: {e}")
 
