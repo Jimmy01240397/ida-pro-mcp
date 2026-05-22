@@ -147,6 +147,13 @@ class IdalibContextFields(TypedDict):
     transport_context_id: NotRequired[str | None]
     isolated_contexts: NotRequired[bool]
     bearer_contexts: NotRequired[bool]
+    # The isolation mode actually in effect for THIS request — distinct
+    # from ``isolated_contexts`` / ``bearer_contexts`` (server-side
+    # enforcement flags). Even when both flags are off, a client may
+    # send an Authorization: Bearer header and opt-in to Bearer
+    # isolation; ``effective_context_mode`` will report ``"bearer"`` in
+    # that case.
+    effective_context_mode: NotRequired[str]  # "bearer" | "transport" | "stdio" | "shared"
 
 
 class IdalibSessionInfo(TypedDict):
@@ -463,7 +470,28 @@ class IdalibSupervisor:
             "transport_context_id": self.mcp.get_current_transport_session_id(),
             "isolated_contexts": self.isolated_contexts,
             "bearer_contexts": self.bearer_contexts,
+            "effective_context_mode": self._effective_context_mode(context_id),
         }
+
+    def _effective_context_mode(self, context_id: str) -> str:
+        """Classify the isolation mode actually used for *context_id*.
+
+        Returns one of:
+          * ``"bearer"`` — a Bearer header was present (either enforced
+            by ``--bearer-contexts`` or opt-in from the client).
+          * ``"stdio"`` — the supervisor's stdio bootstrap context.
+          * ``"shared"`` — the shared-fallback context used when no
+            isolation is requested.
+          * ``"transport"`` — an MCP transport session-id (only seen
+            under ``--isolated-contexts``).
+        """
+        if context_id.startswith("bearer:"):
+            return "bearer"
+        if context_id == STDIO_DEFAULT_CONTEXT_ID:
+            return "stdio"
+        if context_id == SHARED_FALLBACK_CONTEXT_ID:
+            return "shared"
+        return "transport"
 
     def bind_context(self, context_id: str, session_id: str) -> None:
         """Public binding mutation. Takes write lock since it modifies
@@ -1620,7 +1648,24 @@ def idalib_unbind() -> IdalibUnbindResult:
 
 @mcp.tool
 def idalib_list() -> IdalibListResult:
-    """List database workers with context-binding metadata."""
+    """List ALL open database workers (global view).
+
+    By design this is a global view across every context: any caller
+    can see every binary the supervisor has spawned, regardless of
+    isolation mode. Per-entry ``is_current_context: true`` flags the
+    one bound to YOUR context; ``bound_contexts`` reports how many
+    contexts (typically other agents / transport sessions) currently
+    hold the same session.
+
+    For "what is bound to me right now?" use ``idalib_current``
+    instead — that one IS scoped to the calling context.
+
+    The ``effective_context_mode`` in the response tells you which
+    isolation mode the current request was actually classified as
+    (``"bearer"`` / ``"transport"`` / ``"stdio"`` / ``"shared"``) —
+    separate from the server-side ``bearer_contexts`` /
+    ``isolated_contexts`` enforcement flags.
+    """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()

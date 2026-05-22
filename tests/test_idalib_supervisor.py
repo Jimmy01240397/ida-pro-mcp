@@ -643,6 +643,65 @@ def test_context_fields_passes_non_bearer_context_ids_through():
 
 
 # ---------------------------------------------------------------------------
+# effective_context_mode — reflects per-request isolation classification
+# ---------------------------------------------------------------------------
+
+
+def test_effective_context_mode_bearer_when_enforced():
+    sup = supmod.IdalibSupervisor(_BearerMcp(agent_id="agent_alice"), bearer_contexts=True)
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["effective_context_mode"] == "bearer"
+    assert fields["bearer_contexts"] is True
+
+
+def test_effective_context_mode_bearer_when_opt_in_without_flag():
+    """Even with bearer_contexts=False (server-side), a request that
+    sends a Bearer header still reports effective_context_mode=bearer.
+
+    This is the key UX fix — operators reading idalib_list responses
+    can now tell the request was actually Bearer-isolated, instead of
+    being misled by ``bearer_contexts: false`` (which only reports the
+    server enforcement flag, not the per-request behaviour)."""
+    sup = supmod.IdalibSupervisor(_BearerMcp(agent_id="agent_alice"))
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["effective_context_mode"] == "bearer"
+    # Server-side enforcement flag is still off — the per-request mode
+    # is what changed.
+    assert fields["bearer_contexts"] is False
+
+
+def test_effective_context_mode_transport_under_isolated_contexts():
+    sup = supmod.IdalibSupervisor(
+        _BearerMcp(session_id="http:abc"), isolated_contexts=True
+    )
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["effective_context_mode"] == "transport"
+
+
+def test_effective_context_mode_shared_fallback():
+    sup = supmod.IdalibSupervisor(_BearerMcp())  # no flags, no header
+    fields = sup.context_fields(sup.resolve_context_id())
+    assert fields["effective_context_mode"] == "shared"
+    assert fields["context_id"] == supmod.SHARED_FALLBACK_CONTEXT_ID
+
+
+def test_effective_context_mode_stdio_constant():
+    sup = supmod.IdalibSupervisor(_BearerMcp())
+    fields = sup.context_fields(supmod.STDIO_DEFAULT_CONTEXT_ID)
+    assert fields["effective_context_mode"] == "stdio"
+
+
+def test_effective_context_mode_bearer_beats_isolated_when_header_present():
+    sup = supmod.IdalibSupervisor(
+        _BearerMcp(agent_id="agent_alice", session_id="http:abc"),
+        isolated_contexts=True,
+    )
+    fields = sup.context_fields(sup.resolve_context_id())
+    # Bearer wins over transport when both available.
+    assert fields["effective_context_mode"] == "bearer"
+
+
+# ---------------------------------------------------------------------------
 # Refcount-aware close + auto-save before terminate
 # ---------------------------------------------------------------------------
 
