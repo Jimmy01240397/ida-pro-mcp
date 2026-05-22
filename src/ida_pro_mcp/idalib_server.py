@@ -617,8 +617,17 @@ def main():
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
-    # TODO: with background=True the main thread does not fake any
-    # work from @idasync, so we deadlock.
+    #
+    # threaded=False (single-threaded HTTPServer) is REQUIRED here.
+    # idalib has no UI event loop, so @idasync's
+    # ``idaapi.execute_sync(..., MFF_WRITE)`` only completes when the
+    # caller is on the same thread that drives idapro. With
+    # ThreadingHTTPServer each request runs on a fresh worker thread
+    # that the IDA kernel never recognises as the main thread, and
+    # execute_sync blocks forever — every idalib_open hangs in
+    # idapro.open_database on a futex. background=False keeps
+    # serve_forever() on the calling thread, and threaded=False keeps
+    # handlers on that same thread, so execute_sync runs inline.
     if not "IDA_MCP_URL" in os.environ:
         # IDA_MCP_URL is used to set download base url by environment,
         # so we only update download base url if this env var is not
@@ -629,7 +638,7 @@ def main():
         # endpoint this server listens to
         set_download_base_url(f"http://{args.host}:{args.port}")
     MCP_SERVER.serve(host=args.host, port=args.port, background=False,
-                     request_handler=IdaMcpHttpRequestHandler)
+                     request_handler=IdaMcpHttpRequestHandler, threaded=False)
 
 
 if __name__ == "__main__":

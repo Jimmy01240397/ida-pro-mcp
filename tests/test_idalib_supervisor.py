@@ -1124,8 +1124,9 @@ def test_open_session_wait_timeout_none_blocks_until_ready(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_server_serve_always_uses_threading_http_server():
-    """Both background=True and background=False must give a threaded server.
+def test_mcp_server_serve_threaded_true_picks_threading_http_server():
+    """Both background=True and background=False must give a threaded
+    server when threaded=True (the default).
 
     Single-threaded HTTPServer at the supervisor would serialise every
     request, so a long-running tool call from one agent would stall
@@ -1143,6 +1144,31 @@ def test_mcp_server_serve_always_uses_threading_http_server():
             )
         finally:
             srv.stop()
+
+
+def test_mcp_server_serve_threaded_false_picks_single_threaded_http_server():
+    """threaded=False must select plain HTTPServer.
+
+    idalib_server workers REQUIRE this — see the comment in
+    idalib_server.main(). With ThreadingHTTPServer, request-handler
+    threads call @idasync → execute_sync(MFF_WRITE), which posts work
+    to the "IDA main thread"; in idalib there is no UI event loop so
+    the kernel only recognises the thread that drives idapro (the one
+    running serve_forever) as that main thread. A worker-thread call
+    blocks forever in idapro.open_database on a futex.
+    """
+    from http.server import HTTPServer, ThreadingHTTPServer
+
+    srv = supmod.McpServer("test-single")
+    srv.serve(host="127.0.0.1", port=0, background=True, threaded=False)
+    try:
+        assert isinstance(srv._http_server, HTTPServer)
+        # Important: it's HTTPServer, NOT the threaded subclass.
+        assert not isinstance(srv._http_server, ThreadingHTTPServer), (
+            f"threaded=False selected ThreadingHTTPServer; idalib worker would deadlock"
+        )
+    finally:
+        srv.stop()
 
 
 def test_bind_context_blocks_while_supervisor_lock_is_held():

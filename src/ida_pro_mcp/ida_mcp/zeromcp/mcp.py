@@ -636,20 +636,39 @@ class McpServer:
     def prompt(self, func: Callable) -> Callable:
         return self.prompts.method(func)
 
-    def serve(self, host: str, port: int, *, background = True, request_handler = McpHttpRequestHandler):
+    def serve(
+        self,
+        host: str,
+        port: int,
+        *,
+        background = True,
+        request_handler = McpHttpRequestHandler,
+        threaded: bool = True,
+    ):
         if self._running:
             logger.info("[MCP] Server is already running")
             return
 
-        # Create server with deferred binding.
-        # Always use ThreadingHTTPServer so a slow handler (e.g. an
-        # idalib_open spawning a worker, or one agent's long-running
-        # decompile) can't stall every other request. The `background`
-        # flag controls whether serve_forever() runs on a dedicated
-        # thread or the calling thread — independent of request-
-        # handling concurrency at the server socket level.
+        # Server class: ThreadingHTTPServer normally so a slow handler
+        # (idalib_open spawning a worker, a long-running decompile)
+        # doesn't stall every other request. The `background` flag
+        # controls whether serve_forever() runs on a dedicated thread
+        # or the calling thread — independent of request-handling
+        # concurrency at the server socket level.
+        #
+        # idalib_server workers must pass ``threaded=False`` to fall
+        # back to single-threaded HTTPServer. IDA's @idasync uses
+        # ``idaapi.execute_sync(..., MFF_WRITE)`` which posts work to
+        # the "IDA main thread"; in idalib there is no UI event loop,
+        # so the IDA kernel treats the thread that *called* into
+        # idapro (the one running serve_forever) as that main thread.
+        # Threaded mode dispatches each request on a fresh thread that
+        # the IDA kernel will never recognise as main → execute_sync
+        # blocks forever. Single-threaded mode runs the handler inline
+        # on the serve_forever thread, so execute_sync executes inline.
         assert issubclass(request_handler, McpHttpRequestHandler)
-        self._http_server = ThreadingHTTPServer(
+        server_class = ThreadingHTTPServer if threaded else HTTPServer
+        self._http_server = server_class(
             (host, port),
             request_handler,
             bind_and_activate=False
