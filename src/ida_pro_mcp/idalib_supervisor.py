@@ -514,6 +514,36 @@ class IdalibSupervisor:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    def _start_stderr_reader(self, process: subprocess.Popen, port: int) -> None:
+        """Forward a worker's stderr to logger.warning, line by line.
+
+        Daemon thread — exits when stderr EOFs (worker died) or the
+        supervisor's process exits. The port goes into the log prefix
+        so we can tell which worker the line came from when several are
+        running at once.
+        """
+        stream = process.stderr
+        if stream is None:
+            return
+
+        def pump() -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    line = line.rstrip()
+                    if line:
+                        logger.warning("[worker:%d] %s", port, line)
+            except Exception:
+                logger.debug("stderr reader for worker:%d crashed", port, exc_info=True)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=pump, daemon=True, name=f"idalib-worker-stderr-{port}"
+        ).start()
+
     def _spawn_worker(self) -> WorkerSession:
         port = self._pick_port()
         cmd = [
@@ -527,12 +557,21 @@ class IdalibSupervisor:
             *self.worker_args,
         ]
         logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
+        # stderr=PIPE (not DEVNULL): idapro / idalib write their errors
+        # only to stderr (e.g. "Database initialization failed with
+        # error 4" for stale .id0/.id1 leftovers). Forwarding them to
+        # the supervisor's logger means failures show up next to the
+        # "Failed to open database: <path>" line agents receive,
+        # instead of being swallowed.
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            text=True,
         )
+        self._start_stderr_reader(process, port)
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",

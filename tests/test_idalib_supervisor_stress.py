@@ -2320,3 +2320,139 @@ def test_invariant_force_close_session_terminates(tmp_path):
     assert sup.close_session("s") is True
     assert "s" not in sup.sessions
     assert sup.context_bindings == {}
+
+
+# ============================================================================
+# Section J: Worker observability (stderr forwarding + stale IDB cleanup)
+# ============================================================================
+
+
+def test_stderr_reader_forwards_lines_to_warning_logger(caplog):
+    """Lines written to a worker's stderr should appear in supervisor logs.
+
+    Regression guard for the 'Failed to open database: <path>' incident
+    where idapro printed 'Database initialization failed with error 4'
+    on stderr but the supervisor swallowed it (stderr=DEVNULL), so the
+    only signal the agent received was the generic outer error.
+    """
+    import io
+    import time
+
+    class _FakeStderrProc:
+        def __init__(self, stderr_bytes):
+            self.stderr = io.StringIO(stderr_bytes)
+
+    proc = _FakeStderrProc(
+        "FATAL: Database initialization failed with error 4\n"
+        "Worker shutting down\n"
+    )
+    sup = supmod.IdalibSupervisor(supmod.McpServer("t"))
+    with caplog.at_level("WARNING", logger="ida_pro_mcp.idalib_supervisor"):
+        sup._start_stderr_reader(proc, port=12345)
+        # The reader is a daemon thread; give it a moment to drain.
+        for _ in range(20):
+            if any("error 4" in r.message for r in caplog.records):
+                break
+            time.sleep(0.05)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("[worker:12345]" in m and "error 4" in m for m in msgs), msgs
+    assert any("[worker:12345]" in m and "Worker shutting down" in m for m in msgs), msgs
+
+
+def test_stderr_reader_handles_no_stderr_gracefully():
+    """If stderr attribute is None (DEVNULL fallback), reader is a no-op."""
+    class _NoStderr:
+        stderr = None
+    sup = supmod.IdalibSupervisor(supmod.McpServer("t"))
+    # Should not raise.
+    sup._start_stderr_reader(_NoStderr(), port=1)
+
+
+def test_cleanup_stale_idb_intermediates_removes_orphans(tmp_path):
+    """No .i64/.idb companion → all intermediates are orphans → all deleted."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "grep"
+    binary.write_bytes(b"\x7fELF")
+    # The exact incident: a 16K .id0 + a 0-byte .id1 left after crash.
+    for suf in (".id0", ".id1", ".id2", ".nam", ".til"):
+        (tmp_path / f"grep{suf}").write_bytes(b"x")
+
+    removed = cleanup_stale_idb_intermediates(str(binary))
+    assert {p.name for p in removed} == {
+        "grep.id0", "grep.id1", "grep.id2", "grep.nam", "grep.til"
+    }
+    # Binary itself is NEVER touched.
+    assert binary.exists()
+    # Intermediates gone.
+    for suf in (".id0", ".id1", ".id2", ".nam", ".til"):
+        assert not (tmp_path / f"grep{suf}").exists()
+
+
+def test_cleanup_skips_when_packed_i64_present(tmp_path):
+    """If a packed .i64 exists alongside, intermediates are probably an
+    active session — leave everything alone."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "cat"
+    binary.write_bytes(b"\x7fELF")
+    packed = tmp_path / "cat.i64"
+    packed.write_bytes(b"packed")
+    id0 = tmp_path / "cat.id0"
+    id0.write_bytes(b"open session work file")
+
+    removed = cleanup_stale_idb_intermediates(str(binary))
+    assert removed == []
+    assert id0.exists(), "cleanup must not touch intermediates next to a packed DB"
+    assert packed.exists()
+
+
+def test_cleanup_skips_when_packed_idb_present(tmp_path):
+    """32-bit packed db (.idb) also blocks cleanup."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "old32"
+    binary.write_bytes(b"x")
+    (tmp_path / "old32.idb").write_bytes(b"packed32")
+    (tmp_path / "old32.id0").write_bytes(b"x")
+
+    removed = cleanup_stale_idb_intermediates(str(binary))
+    assert removed == []
+
+
+def test_cleanup_only_removes_present_intermediates(tmp_path):
+    """Only files that actually exist are returned — no errors for absent ones."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "wc"
+    binary.write_bytes(b"x")
+    # Only .id0 + .id1 (the smoking-gun pair from the incident).
+    (tmp_path / "wc.id0").write_bytes(b"x")
+    (tmp_path / "wc.id1").write_bytes(b"")
+
+    removed = cleanup_stale_idb_intermediates(str(binary))
+    assert {p.name for p in removed} == {"wc.id0", "wc.id1"}
+
+
+def test_cleanup_noop_when_nothing_to_remove(tmp_path):
+    """Clean state (binary only) → returns empty, no errors."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "clean"
+    binary.write_bytes(b"x")
+    assert cleanup_stale_idb_intermediates(str(binary)) == []
+
+
+def test_cleanup_logs_each_removal(tmp_path, caplog):
+    """Every removal emits a WARNING with the path — operators can grep logs."""
+    from ida_pro_mcp._idb_paths import cleanup_stale_idb_intermediates
+
+    binary = tmp_path / "foo"
+    binary.write_bytes(b"x")
+    (tmp_path / "foo.id0").write_bytes(b"x")
+
+    with caplog.at_level("WARNING", logger="ida_pro_mcp._idb_paths"):
+        cleanup_stale_idb_intermediates(str(binary))
+
+    assert any("foo.id0" in r.getMessage() and "stale" in r.getMessage()
+               for r in caplog.records)

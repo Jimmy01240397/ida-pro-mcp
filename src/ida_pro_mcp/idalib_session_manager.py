@@ -15,6 +15,8 @@ from datetime import datetime
 import idapro
 import ida_auto
 
+from ._idb_paths import cleanup_stale_idb_intermediates
+
 logger = logging.getLogger(__name__)
 
 
@@ -280,6 +282,8 @@ class IDASessionManager:
             logger.debug("Closing active database before opening %s", input_path)
             idapro.close_database()
             self._active_session_id = None
+
+        cleanup_stale_idb_intermediates(input_path)
 
         if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
             raise RuntimeError(f"Failed to open database: {input_path}")
