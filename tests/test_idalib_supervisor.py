@@ -625,7 +625,13 @@ def test_context_fields_surfaces_bearer_state_without_leaking_agent_id():
     assert "agent_alice" not in str(fields), (
         f"Bearer hash leaked into response: {fields}"
     )
-    assert fields["bearer_contexts"] is True
+    # bearer_contexts / isolated_contexts no longer echoed in responses
+    # (they were operator-side CLI flags, not per-request behaviour, and
+    # were misleading agents into thinking isolation was off when their
+    # own Bearer header opted them in). Use effective_context_mode instead.
+    assert "bearer_contexts" not in fields
+    assert "isolated_contexts" not in fields
+    assert fields["effective_context_mode"] == "bearer"
 
 
 def test_context_fields_passes_non_bearer_context_ids_through():
@@ -651,23 +657,23 @@ def test_effective_context_mode_bearer_when_enforced():
     sup = supmod.IdalibSupervisor(_BearerMcp(agent_id="agent_alice"), bearer_contexts=True)
     fields = sup.context_fields(sup.resolve_context_id())
     assert fields["effective_context_mode"] == "bearer"
-    assert fields["bearer_contexts"] is True
+    # Server-side flags are no longer surfaced in the response.
+    assert "bearer_contexts" not in fields
 
 
 def test_effective_context_mode_bearer_when_opt_in_without_flag():
     """Even with bearer_contexts=False (server-side), a request that
     sends a Bearer header still reports effective_context_mode=bearer.
 
-    This is the key UX fix — operators reading idalib_list responses
-    can now tell the request was actually Bearer-isolated, instead of
-    being misled by ``bearer_contexts: false`` (which only reports the
-    server enforcement flag, not the per-request behaviour)."""
+    Operators reading idalib_list responses can tell from
+    effective_context_mode that the request was Bearer-isolated even
+    when --bearer-contexts isn't set (the opt-in path)."""
     sup = supmod.IdalibSupervisor(_BearerMcp(agent_id="agent_alice"))
     fields = sup.context_fields(sup.resolve_context_id())
     assert fields["effective_context_mode"] == "bearer"
-    # Server-side enforcement flag is still off — the per-request mode
-    # is what changed.
-    assert fields["bearer_contexts"] is False
+    # No longer echoed — see test above.
+    assert "bearer_contexts" not in fields
+    assert "isolated_contexts" not in fields
 
 
 def test_effective_context_mode_transport_under_isolated_contexts():

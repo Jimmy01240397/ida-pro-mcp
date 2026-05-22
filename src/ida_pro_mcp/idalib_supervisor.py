@@ -145,14 +145,12 @@ _discovery = _import_discovery()
 class IdalibContextFields(TypedDict):
     context_id: NotRequired[str]
     transport_context_id: NotRequired[str | None]
-    isolated_contexts: NotRequired[bool]
-    bearer_contexts: NotRequired[bool]
-    # The isolation mode actually in effect for THIS request — distinct
-    # from ``isolated_contexts`` / ``bearer_contexts`` (server-side
-    # enforcement flags). Even when both flags are off, a client may
-    # send an Authorization: Bearer header and opt-in to Bearer
-    # isolation; ``effective_context_mode`` will report ``"bearer"`` in
-    # that case.
+    # The isolation mode actually in effect for THIS request. Replaces
+    # the older ``isolated_contexts`` / ``bearer_contexts`` server-flag
+    # echoes — those were confusing because they reported server CLI
+    # configuration, not the per-request isolation behaviour. To check
+    # operator-side enforcement, inspect the server's startup args or
+    # /config endpoint instead.
     effective_context_mode: NotRequired[str]  # "bearer" | "transport" | "stdio" | "shared"
 
 
@@ -168,10 +166,10 @@ class IdalibSessionInfo(TypedDict):
 
 class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     is_active: bool
-    is_current_context: bool
-    bound_contexts: int
+    is_mine: bool          # this session is bound to MY context
+    ref_count: int         # how many contexts currently hold a binding to it
     backend: str
-    owned: bool
+    supervisor_managed: bool  # supervisor owns the process and can terminate it
     pid: int | None
     worker_pid: int | None
 
@@ -348,14 +346,14 @@ class WorkerSession:
             "metadata": self.metadata,
         }
 
-    def to_list_dict(self, *, current: bool, bound_contexts: int) -> IdalibSessionListInfo:
+    def to_list_dict(self, *, is_mine: bool, ref_count: int) -> IdalibSessionListInfo:
         return {
             **self.to_dict(),
             "is_active": self.is_alive(),
-            "is_current_context": current,
-            "bound_contexts": bound_contexts,
+            "is_mine": is_mine,
+            "ref_count": ref_count,
             "backend": self.backend,
-            "owned": self.owned,
+            "supervisor_managed": self.owned,
             "pid": self.pid if self.pid is not None else (self.process.pid if self.process is not None else None),
             "worker_pid": self.process.pid if self.process is not None else None,
         }
@@ -468,8 +466,6 @@ class IdalibSupervisor:
         return {
             "context_id": public_context_id,
             "transport_context_id": self.mcp.get_current_transport_session_id(),
-            "isolated_contexts": self.isolated_contexts,
-            "bearer_contexts": self.bearer_contexts,
             "effective_context_mode": self._effective_context_mode(context_id),
         }
 
@@ -1393,19 +1389,34 @@ class IdalibSupervisor:
             f"Worker for session '{session.session_id}' is not running"
         )
 
-    def list_sessions(self, context_id: str) -> list[IdalibSessionListInfo]:
+    def list_sessions(
+        self, context_id: str, *, mine_only: bool = True
+    ) -> list[IdalibSessionListInfo]:
+        """List worker sessions.
+
+        ``mine_only=True`` (default) returns ONLY sessions bound to
+        the calling ``context_id`` — the per-agent view. Pass
+        ``mine_only=False`` to get the global view of every session
+        the supervisor has spawned (useful for operators / debugging,
+        but exposes other agents' filenames + session_ids).
+        """
         with self._rw_lock.read():
             current = self.context_bindings.get(context_id)
             binding_counts: dict[str, int] = {}
             for bound in self.context_bindings.values():
                 binding_counts[bound] = binding_counts.get(bound, 0) + 1
-            return [
-                session.to_list_dict(
-                    current=session.session_id == current,
-                    bound_contexts=binding_counts.get(session.session_id, 0),
+            entries = []
+            for session in self.sessions.values():
+                is_mine = session.session_id == current
+                if mine_only and not is_mine:
+                    continue
+                entries.append(
+                    session.to_list_dict(
+                        is_mine=is_mine,
+                        ref_count=binding_counts.get(session.session_id, 0),
+                    )
                 )
-                for session in self.sessions.values()
-            ]
+            return entries
 
     # ------------------------------------------------------------------
     # Schema/resource forwarding
@@ -1647,29 +1658,32 @@ def idalib_unbind() -> IdalibUnbindResult:
 
 
 @mcp.tool
-def idalib_list() -> IdalibListResult:
-    """List ALL open database workers (global view).
+def idalib_list(
+    all: Annotated[
+        bool,
+        "Return the global view across every context (default false = only sessions bound to YOUR context).",
+    ] = False,
+) -> IdalibListResult:
+    """List database workers bound to YOUR context (default), or all of them.
 
-    By design this is a global view across every context: any caller
-    can see every binary the supervisor has spawned, regardless of
-    isolation mode. Per-entry ``is_current_context: true`` flags the
-    one bound to YOUR context; ``bound_contexts`` reports how many
-    contexts (typically other agents / transport sessions) currently
-    hold the same session.
+    Default behaviour (``all=False``): returns only sessions whose
+    binding belongs to the calling context — what most callers want
+    ("what binaries do I have open?"). Each entry's ``ref_count`` still
+    reports the total binding count across every context, so you can
+    see when a worker you share with other agents is no longer solo.
 
-    For "what is bound to me right now?" use ``idalib_current``
-    instead — that one IS scoped to the calling context.
+    Pass ``all=True`` for the operator / debug view: every session the
+    supervisor has spawned, including binaries other agents opened.
+    Per-entry ``is_mine: true`` flags the one bound to YOUR context.
 
-    The ``effective_context_mode`` in the response tells you which
-    isolation mode the current request was actually classified as
-    (``"bearer"`` / ``"transport"`` / ``"stdio"`` / ``"shared"``) —
-    separate from the server-side ``bearer_contexts`` /
-    ``isolated_contexts`` enforcement flags.
+    ``effective_context_mode`` in the response tells you which
+    isolation mode the current request actually used (``"bearer"`` /
+    ``"transport"`` / ``"stdio"`` / ``"shared"``).
     """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
-        sessions = sup.list_sessions(context_id)
+        sessions = sup.list_sessions(context_id, mine_only=not all)
         return {
             "sessions": sessions,
             "count": len(sessions),
@@ -1797,12 +1811,13 @@ def idalib_warmup(
 
 @mcp.resource("ida://databases")
 def databases_resource() -> dict:
-    """List open idalib worker databases."""
+    """List open idalib worker databases bound to YOUR context."""
     sup = _require_supervisor()
     context_id = sup.resolve_context_id()
+    databases = sup.list_sessions(context_id, mine_only=True)
     return {
-        "databases": sup.list_sessions(context_id),
-        "count": len(sup.sessions),
+        "databases": databases,
+        "count": len(databases),
         **sup.context_fields(context_id),
     }
 

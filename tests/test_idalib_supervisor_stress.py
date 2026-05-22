@@ -1614,13 +1614,29 @@ def test_list_sessions_empty():
     assert sup.list_sessions("ctxA") == []
 
 
-def test_list_sessions_returns_all(tmp_path):
+def test_list_sessions_default_only_returns_mine(tmp_path):
+    """mine_only=True (default): only sessions bound to ctx0 → 1."""
     files = _make_files(tmp_path, 3)
     sup = _FakeSupervisor()
     for i, f in enumerate(files):
         sup.open_session(str(f), session_id=f"s{i}", context_id=f"ctx{i}")
     listed = sup.list_sessions("ctx0")
+    assert len(listed) == 1
+    assert listed[0]["session_id"] == "s0"
+    assert listed[0]["is_mine"] is True
+
+
+def test_list_sessions_all_returns_global_view(tmp_path):
+    files = _make_files(tmp_path, 3)
+    sup = _FakeSupervisor()
+    for i, f in enumerate(files):
+        sup.open_session(str(f), session_id=f"s{i}", context_id=f"ctx{i}")
+    listed = sup.list_sessions("ctx0", mine_only=False)
     assert len(listed) == 3
+    # is_mine flag still correctly identifies ctx0's session.
+    mine = [s for s in listed if s["is_mine"]]
+    assert len(mine) == 1
+    assert mine[0]["session_id"] == "s0"
 
 
 def test_list_sessions_marks_current(tmp_path):
@@ -1629,17 +1645,18 @@ def test_list_sessions_marks_current(tmp_path):
     sup = _FakeSupervisor()
     sup.open_session(str(sample), session_id="s", context_id="ctxA")
     listed = sup.list_sessions("ctxA")
-    assert listed[0]["is_current_context"] is True
-    assert listed[0]["bound_contexts"] == 1
+    assert listed[0]["is_mine"] is True
+    assert listed[0]["ref_count"] == 1
 
 
 def test_list_sessions_marks_other_context_not_current(tmp_path):
+    """ctxOther is unbound; under mine_only=False it sees s with is_mine=False."""
     sample = tmp_path / "s.bin"
     sample.write_bytes(b"x")
     sup = _FakeSupervisor()
     sup.open_session(str(sample), session_id="s", context_id="ctxA")
-    listed = sup.list_sessions("ctxOther")
-    assert listed[0]["is_current_context"] is False
+    listed = sup.list_sessions("ctxOther", mine_only=False)
+    assert listed[0]["is_mine"] is False
 
 
 def test_list_sessions_counts_bindings(tmp_path):
@@ -1650,7 +1667,7 @@ def test_list_sessions_counts_bindings(tmp_path):
     sup.bind_context("ctxB", "s")
     sup.bind_context("ctxC", "s")
     listed = sup.list_sessions("ctxA")
-    assert listed[0]["bound_contexts"] == 3
+    assert listed[0]["ref_count"] == 3
 
 
 def test_list_pending_empty():
@@ -1686,7 +1703,7 @@ def test_list_sessions_under_concurrent_reads(tmp_path):
 
     def lister(i):
         for _ in range(10):
-            listed = sup.list_sessions(f"ctx{i}")
+            listed = sup.list_sessions(f"ctx{i}", mine_only=False)
             with results_lock:
                 results.append(len(listed))
 
